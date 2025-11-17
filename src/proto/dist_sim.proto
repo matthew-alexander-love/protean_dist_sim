@@ -1,0 +1,271 @@
+syntax = "proto3";
+
+package protean_proto.sim;
+
+option optimize_for = LITE_RUNTIME;
+
+import "onnx-ml.proto";
+import "protean.proto";
+
+/* --------------------- Services --------------------- */
+
+service WorkerNode {
+    // Lifecycle & Configuration
+    /// Set worker-wide simulation configuration
+    rpc SetConfig(SimConfigProto) returns (Ack) {}
+
+    /// Load embeddings into worker's embedding pool
+    rpc LoadEmbeddings(LoadEmbeddingsRequest) returns (Ack) {}
+
+    /// Create multiple peers at once (for bootstrapping)
+    rpc CreatePeers(CreatePeersRequest) returns (Ack) {}
+
+    /// Delete specific peers by UUID
+    rpc DeletePeers(DeletePeersRequest) returns (Ack) {}
+
+    /// Start a Churn Pattern
+    rpc Churn(ChurnPatternRequest) returns (Ack) {}
+
+    // Query Execution
+    /// Execute a query from a specific peer
+    rpc ExecuteQuery(QueryRequest) returns (QueryResponse) {}
+
+    /// Calculate the true Knn for all nodes on this worker via bruteforce
+    /// Coordinator calls on all worker nodes and then reduces to true k to know
+    /// global optimal
+    rpc TrueQuery(QueryRequest) returns (QueryResponse) {}
+
+    // State Management
+    /// Get snapshot of current network state (all or filtered peers)
+    rpc GetSnapshot(SnapshotRequest) returns (NetworkSnapshot) {}
+
+    /// Load network state from snapshot
+    rpc LoadSnapshot(NetworkSnapshot) returns (Ack) {}
+
+    /// Health check
+    rpc Ping(PingRequest) returns (Ack) {} //
+
+    /// Inform about another worker that can be sent messages
+    rpc RegisterWorker(WorkerInfo) returns (Ack) {}
+
+    /// Route a protocol message to a peer on this worker
+    rpc RouteMessage(RouteMessageRequest) returns (Ack) {}
+}
+
+service Coordinator {
+    // Worker Registration & Health
+    /// Worker registers with coordinator
+    rpc RegisterWorker(WorkerInfo) returns (WorkerIdResponse) {}
+
+    /// Periodic heartbeat from worker
+    rpc Heartbeat(HeartbeatRequest) returns (Ack) {}
+
+    /// Worker unregisters (graceful shutdown)
+    rpc UnregisterWorker(WorkerIdRequest) returns (Ack) {}
+
+    rpc ForwardEvent(ProteanEventProto) returns (Ack) {}
+}
+
+
+/* --------------------- Common Messages --------------------- */
+
+message Ack {
+    bool success = 1;
+    string message = 2;
+}
+
+message PingRequest {
+    // Empty - just a health check
+}
+
+message ResetRequest {
+    // Empty - clear all state
+}
+
+/* --------------------- Configuration Messages --------------------- */
+
+/// Worker-wide simulation configuration
+message SimConfigProto {
+    protean_proto.SnvConfigProto snv_config = 1;
+    uint32 max_peers = 2;  // Maximum peers this worker can host
+    string region = 3;  // Region/zone identifier
+}
+
+/* --------------------- Embedding Management Messages --------------------- */
+
+/// Request to load embeddings into worker's embedding pool
+message LoadEmbeddingsRequest {
+    uint64 global_offset = 1;                  // Starting global index for this worker's pool
+    repeated onnx.TensorProto embeddings = 2;  // Embeddings to load
+}
+
+/* --------------------- Peer Lifecycle Messages --------------------- */
+
+/// Request to create multiple peers
+message CreatePeersRequest {
+    repeated uint64 global_indices = 1;  // Global dataset indices for peers to create
+    uint64 bootstrap_index = 2;          // Global index of bootstrap peer (0 = no bootstrap)
+}
+
+/// Request to delete specific peers
+message DeletePeersRequest {
+    repeated uint64 global_indices = 1;  // Global indices of peers to delete
+}
+
+/* --------------------- Churn Pattern Messages --------------------- */
+
+/// Types of churn patterns
+enum ChurnPatternType {
+    UNSPECIFIED = 0;      // Default/unspecified churn type
+    GRADUAL_JOIN = 1;     // Gradually add peers over time
+    GRADUAL_LEAVE = 2;    // Gradually remove peers over time
+    FLASH_CROWD = 3;      // Sudden spike of joins
+    MASS_DEPARTURE = 4;   // Sudden spike of leaves
+    EMBEDDING_DRIFT = 5;  // Cause embeddings to drift
+}
+
+/// Churn pattern configuration
+message ChurnConfig {
+    repeated uint64 global_indices = 1;      // Global dataset indices for peers to add/remove
+    repeated uint64 bootstrap_indices = 2;   // Global indices of bootstrap peers
+    uint64 duration_ms = 3;                  // Duration over which churn occurs
+    float rate_per_second = 4;               // Rate of churn events (for gradual patterns)
+
+    // EMBEDDING_DRIFT specific fields
+    repeated uint64 drift_target_indices = 5;  // Target embedding indices for drift (one per peer in global_indices)
+    uint32 drift_steps = 6;                    // Number of update steps for drift (distributed over duration_ms)
+}
+
+/// Request to apply a churn pattern
+message ChurnPatternRequest {
+    ChurnPatternType pattern = 1;
+    ChurnConfig config = 2;
+}
+
+/* --------------------- Query Messages --------------------- */
+
+/// Request to execute a query from a specific peer
+message QueryRequest {
+    bytes source_peer_uuid = 1;             // UUID of peer executing the query
+    onnx.TensorProto query_embedding = 2;   // Query point in embedding space
+    uint32 k = 3;                            // Number of neighbors to find
+    protean_proto.QueryConfigProto config = 4;  // Query execution config
+}
+
+/// Response containing query results
+message QueryResponse {
+    bytes query_uuid = 1;                                 // Unique query identifier
+    repeated protean_proto.QueryCandidateProto results = 2;  // Query results
+    uint32 hops = 3;                                      // Number of network hops
+    uint64 latency_ms = 4;                                // Total query latency
+    bool success = 5;                                     // Whether query completed successfully
+    string error_message = 6;                             // Error message if failed
+}
+
+/* --------------------- Snapshot Messages --------------------- */
+
+/// Request for network snapshot
+message SnapshotRequest {
+    repeated bytes peer_uuids = 1;  // Specific peers to snapshot (empty = all)
+}
+
+/// Complete network snapshot
+message NetworkSnapshot {
+    uint64 timestamp_ms = 1;  // Snapshot timestamp
+    string worker_id = 2;      // Worker that generated this snapshot
+    repeated protean_proto.SparseNeighborViewProto peer_snapshots = 3;
+}
+
+/* --------------------- Worker Registration Messages --------------------- */
+
+/// Worker information for registration
+message WorkerInfo {
+    string address = 1;           // gRPC address of worker (host:port)
+    uint32 capacity = 2;          // Maximum peers this worker can host
+    string region = 3;            // Region/zone identifier (empty if none)
+    string version = 4;           // Worker software version (empty if none)
+}
+
+/// Response containing assigned worker ID
+message WorkerIdResponse {
+    string worker_id = 1;  // Unique worker identifier assigned by coordinator
+    bool success = 2;
+    string message = 3;
+}
+
+/// Request with worker ID
+message WorkerIdRequest {
+    string worker_id = 1;
+}
+
+/// Heartbeat from worker to coordinator
+message HeartbeatRequest {
+    string worker_id = 1;
+    uint32 active_peers = 2;      // Current number of active peers
+    float cpu_usage = 3;           // CPU usage percentage (0-100)
+    float memory_usage = 4;        // Memory usage percentage (0-100)
+}
+
+/* --------------------- Message Routing Messages --------------------- */
+
+/// Request to route a protocol message to a peer
+message RouteMessageRequest {
+    bytes destination_uuid = 1;                      // UUID of destination peer
+    protean_proto.ProteanMessageProto message = 2;   // Protocol message to route
+}
+
+/* --------------------- Event Streaming Messages --------------------- */
+
+/// Configuration for event streaming
+message EventStreamConfig {
+    string worker_id = 1;  // Worker identifier
+    uint32 buffer_size = 2;  // Event buffer size (default: 10000)
+}
+
+/// Protean event types that can be streamed
+enum ProteanEventType {
+    STATE_CHANGED = 0;
+    QUERY_COMPLETED = 1;
+    BOOTSTRAP_CONVERGING_COMPLETED = 2;
+    BOOTSTRAP_COMPLETED = 3;
+}
+
+/// Event: Peer state transition
+message StateChangedEvent {
+    bytes peer_uuid = 1;
+    string from_state = 2;  // e.g., "Disconnected", "Connected", "Bootstrapping"
+    string to_state = 3;
+}
+
+/// Event: Query completed with results
+message QueryCompletedEvent {
+    bytes peer_uuid = 1;
+    bytes query_uuid = 2;
+    repeated protean_proto.QueryCandidateProto candidates = 3;
+    uint32 hops = 4;
+    uint64 latency_ms = 5;
+}
+
+/// Event: Bootstrap converging phase completed
+message BootstrapConvergingCompletedEvent {
+    bytes peer_uuid = 1;
+}
+
+/// Event: Bootstrap fully completed
+message BootstrapCompletedEvent {
+    bytes peer_uuid = 1;
+}
+
+/// Unified event message
+message ProteanEventProto {
+    ProteanEventType event_type = 1;
+    string worker_id = 2;
+    uint64 timestamp_ms = 3;  // Event timestamp (ms since epoch)
+
+    oneof event {
+        StateChangedEvent state_changed = 4;
+        QueryCompletedEvent query_completed = 5;
+        BootstrapConvergingCompletedEvent bootstrap_converging_completed = 6;
+        BootstrapCompletedEvent bootstrap_completed = 7;
+    }
+}

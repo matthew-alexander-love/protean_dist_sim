@@ -1,0 +1,225 @@
+syntax = "proto3";
+
+package protean_proto;
+
+option optimize_for = LITE_RUNTIME;
+
+import "onnx-ml.proto";
+
+/* --------------------- Protean Basic Types --------------------- */
+
+message DistanceProto {
+    enum DataType {
+        UNDEFINED = 0;
+        // Basic types.
+        FLOAT = 1;   // float
+        UINT8 = 2;   // uint8_t
+        INT8 = 3;    // int8_t
+        UINT16 = 4;  // uint16_t
+        INT16 = 5;   // int16_t
+        INT32 = 6;   // int32_t
+        INT64 = 7;   // int64_t
+        STRING = 8;  // string
+        BOOL = 9;    // bool
+
+        // IEEE754 half-precision floating-point format (16 bits wide).
+        // This format has 1 sign bit, 5 exponent bits, and 10 mantissa bits.
+        FLOAT16 = 10;
+
+        DOUBLE = 11;
+        UINT32 = 12;
+        UINT64 = 13;
+        COMPLEX64 = 14;     // complex with float32 real and imaginary components
+        COMPLEX128 = 15;    // complex with float64 real and imaginary components
+
+        // Non-IEEE floating-point format based on IEEE754 single-precision
+        // floating-point number truncated to 16 bits.
+        // This format has 1 sign bit, 8 exponent bits, and 7 mantissa bits.
+        BFLOAT16 = 16;
+
+        // Non-IEEE floating-point format based on papers
+        // FP8 Formats for Deep Learning, https://arxiv.org/abs/2209.05433,
+        // 8-bit Numerical Formats For Deep Neural Networks, https://arxiv.org/pdf/2206.02915.pdf.
+        // Operators supported FP8 are Cast, CastLike, QuantizeLinear, DequantizeLinear.
+        // The computation usually happens inside a block quantize / dequantize
+        // fused by the runtime.
+        FLOAT8E4M3FN = 17;    // float 8, mostly used for coefficients, supports nan, not inf
+        FLOAT8E4M3FNUZ = 18;  // float 8, mostly used for coefficients, supports nan, not inf, no negative zero
+        FLOAT8E5M2 = 19;      // follows IEEE 754, supports nan, inf, mostly used for gradients
+        FLOAT8E5M2FNUZ = 20;  // follows IEEE 754, supports nan, not inf, mostly used for gradients, no negative zero
+
+        // 4-bit integer data types
+        UINT4 = 21;  // Unsigned integer in range [0, 15]
+        INT4 = 22;   // Signed integer in range [-8, 7], using two's-complement representation
+
+        // 4-bit floating point data types
+        FLOAT4E2M1 = 23;
+
+        // E8M0 type used as the scale for microscaling (MX) formats:
+        // https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+        FLOAT8E8M0 = 24;
+
+        // Future extensions go here.
+    }
+
+    int32 data_type = 1;
+
+    // For float and complex64 values
+    // Complex64 tensors are encoded as a single array of floats,
+    // with the real components appearing in odd numbered positions,
+    // and the corresponding imaginary component appearing in the
+    // subsequent even numbered position. (e.g., [1.0 + 2.0i, 3.0 + 4.0i]
+    // is encoded as [1.0, 2.0 ,3.0 ,4.0]
+    // When this field is present, the data_type field MUST be FLOAT or COMPLEX64.
+    repeated float float_data = 2 [packed = true];
+
+    // For int32, uint8, int8, uint16, int16, uint4, int4, bool, (b)float16, float8, and float4:
+    // - (b)float16 and float8 values MUST be converted bit-wise into an unsigned integer
+    //   representation before being written to the buffer.
+    // - Each pair of uint4, int4, and float4 values MUST be packed as two 4-bit elements into a single byte.
+    //   The first element is stored in the 4 least significant bits (LSB),
+    //   and the second element is stored in the 4 most significant bits (MSB).
+    //
+    // Consequently:
+    // - For data types with a bit-width of 8 or greater, each `int32_data` stores one element.
+    // - For 4-bit data types, each `int32_data` stores two elements.
+    //
+    // When this field is present, the data_type field MUST be
+    // INT32, INT16, INT8, INT4, UINT16, UINT8, UINT4, BOOL, FLOAT16, BFLOAT16, FLOAT8E4M3FN, FLOAT8E4M3FNUZ, FLOAT8E5M2, FLOAT8E5M2FNUZ, FLOAT8E8M0, FLOAT4E2M1
+    repeated int32 int32_data = 3 [packed = true];
+
+    // For strings.
+    // Each element of string_data is a UTF-8 encoded Unicode
+    // string. No trailing null, no leading BOM. The protobuf "string"
+    // scalar type is not used to match ML community conventions.
+    // When this field is present, the data_type field MUST be STRING
+    repeated bytes string_data = 6;
+
+    // For int64.
+    // When this field is present, the data_type field MUST be INT64
+    repeated int64 int64_data = 7 [packed = true];
+}
+
+// Defining Values of a uniquely routable and useable peer in the protean network
+message PeerProto {
+    onnx.TensorProto embedding = 1;
+    bytes uuid = 2;
+    string address = 3;
+}
+/// A peer with distance relative to some reference point
+message QueryCandidateProto {
+    PeerProto peer = 1;
+    DistanceProto distance = 2;
+}
+
+/// Configuration for query execution
+message QueryConfigProto {
+    uint32 search_list_size = 1;
+    uint32 concurrency_limit = 2;
+    uint32 share_floor = 3;
+    uint64 timeout = 4;
+}
+
+/// Peer status in SNV
+enum PeerStatusProto {
+    CONNECTED = 0;
+    SUSPECT = 1;
+}
+
+/// SNV peer entry
+message SnvPeerProto {
+    PeerProto peer = 1;
+    PeerStatusProto status = 2;
+    DistanceProto dist_to_local = 3;
+}
+
+/// Exploration configuration for converge (k-NN) and explore (k-FN) queries
+message ExplorationConfigProto {
+    uint32 converge_k = 1;
+    QueryConfigProto converge_config = 2;
+    uint32 explore_k = 3;
+    QueryConfigProto explore_config = 4;
+}
+
+/// SNV configuration
+message SnvConfigProto {
+    uint32 concurrency_limit = 1;
+    uint64 timeout_ms = 2;
+    float occlusion_threshold = 3;
+    float drift_threshold = 4;
+    float target_degree_ratio = 5;
+    float dynamism_threshold = 6;
+    ExplorationConfigProto exploration_config = 7;
+    uint64 max_exploration_interval_secs = 8;  // 0 means no periodic exploration
+}
+
+/// Complete SNV state for persistence
+message SparseNeighborViewProto {
+    bytes local_uuid = 1;
+    onnx.TensorProto local_embedding = 2;
+    repeated SnvPeerProto peers = 3;  // First num_routable are routable peers
+    uint32 num_routable = 4;  // Number of routable peers at start of peers list
+    uint32 dynamism = 5;  // Change counter since last rebalance
+    SnvConfigProto config = 6;
+}
+
+/* --------------------- Protean Protocol Messages --------------------- */
+
+// Are you there?
+message PingProto {
+    PeerProto source = 1;
+}
+
+// Response with most up-to-date information
+message PingResponseProto {
+    PeerProto source = 1;
+}
+
+// Request the local SNV for its closest K known peers
+// Contains internal KnnRequest fields + routing source
+message KnnProto {
+    PeerProto source = 1;
+    bytes query_uuid = 2;
+    onnx.TensorProto query = 3;
+    uint32 k = 4;
+}
+
+/// Response to a single Knn request
+/// Contains internal KnnResponse fields + routing source
+message KnnResponseProto {
+    PeerProto source = 1;
+    bytes query_uuid = 2;
+    repeated QueryCandidateProto candidates = 3;
+}
+
+// Request the local SNV for its farthest K known peers (for explore queries)
+// Contains internal KfnRequest fields + routing source
+message KfnProto {
+    PeerProto source = 1;
+    bytes query_uuid = 2;
+    onnx.TensorProto query = 3;
+    uint32 k = 4;
+}
+
+/// Response to a single Kfn request
+/// Contains internal KfnResponse fields + routing source
+message KfnResponseProto {
+    PeerProto source = 1;
+    bytes query_uuid = 2;
+    repeated QueryCandidateProto candidates = 3;
+}
+
+/* --------------------- Core Protocol Messages Only --------------------- */
+
+/* --------------------- Protean Message Envelope --------------------- */
+
+message ProteanMessageProto {
+    oneof message {
+        PingProto ping = 1;
+        PingResponseProto ping_response = 2;
+        KnnProto knn = 3;
+        KnnResponseProto knn_response = 4;
+        KfnProto kfn = 11;
+        KfnResponseProto kfn_response = 12;
+    }
+}
