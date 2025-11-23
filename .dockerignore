@@ -1,0 +1,45 @@
+# Rust build artifacts
+target/
+**/target/
+Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation and examples (except configs we need)
+*.md
+docs/
+examples/
+
+# Test files
+tests/
+**/tests/
+
+# Temporary and output files
+tmp/
+*.tmp
+*.log
+output/
+
+# Docker files
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Other
+*.bak
+*.orig

@@ -1,0 +1,46 @@
+---
+# PersistentVolumeClaim for Dataset
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dataset-pvc
+  namespace: protean
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard-rwo
+
+---
+# PersistentVolumeClaim for Output
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: output-pvc
+  namespace: protean
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard-rwx
+
+---
+# Alternative: Use GCS Fuse for datasets (recommended for large files)
+# apiVersion: v1
+# kind: PersistentVolume
+# metadata:
+#   name: dataset-gcs-pv
+#   namespace: protean
+# spec:
+#   capacity:
+#     storage: 100Gi
+#   accessModes:
+#     - ReadOnlyMany
+#   csi:
+#     driver: gcsfuse.csi.storage.gke.io
+#     volumeHandle: gs://your-bucket-name/datasets/
+#     readOnly: true

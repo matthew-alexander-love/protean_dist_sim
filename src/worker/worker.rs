@@ -44,7 +44,7 @@ use crate::proto::dist_sim::{
     worker_node_server::WorkerNode, worker_node_client::WorkerNodeClient,
     coordinator_client::CoordinatorClient, RouteMessageRequest, Ack,
     SimConfigProto, LoadEmbeddingsRequest, CreatePeersRequest, DeletePeersRequest,
-    ChurnPatternRequest, ChurnPatternType,
+    BootstrapPeerRequest, ChurnPatternRequest, ChurnPatternType, BootstrapPeerInfo,
     QueryRequest, QueryResponse, SnapshotRequest, NetworkSnapshot, WorkerInfo,
     ProteanEventProto, PingRequest,
     protean_event_proto, ProteanEventType, StateChangedEvent, QueryCompletedEvent,
@@ -70,6 +70,7 @@ use protean::{
     protean::ProteanEvent,
     proto::TensorProto,
     uuid::Uuid,
+    query::QueryResult,
 };
 
 /// Commands sent to the churn background thread
@@ -125,8 +126,11 @@ pub struct Worker<S: EmbeddingSpace> {
     /// Embedding pool for this worker (indexed by local index)
     pub(crate) embedding_pool: Arc<RwLock<Vec<S::EmbeddingData>>>,
 
-    /// Global offset for this worker's embeddings (e.g., 100 if this worker owns embeddings 100-9999)
+    /// Global offset for this worker's embeddings (worker index for round-robin distribution)
     pub(crate) global_offset: Arc<RwLock<u64>>,
+
+    /// Total number of workers (for round-robin indexing)
+    n_workers: usize,
 
     // Phase tracking for event matching, query tracking, churn tracking
     // etc. to know progress from monitor
@@ -141,6 +145,9 @@ pub struct Worker<S: EmbeddingSpace> {
 
     /// Shutdown Nodes:
     shutdown_actors: DashMap<Uuid, ()>,
+
+    /// Pending queries waiting for results (query_uuid -> result channel)
+    pending_queries: Arc<DashMap<Uuid, oneshot::Sender<QueryResult<S>>>>,
 }
 
 // Snapshot request, create directory with timestamped at the time,
@@ -174,9 +181,12 @@ impl<S: EmbeddingSpace> Worker<S> {
             runtime.handle().clone(),
         );
 
+        let pending_queries = Arc::new(DashMap::new());
+
         let event_processor_handle = Self::spawn_event_processor_thread(
             worker_id.clone(),
             Arc::clone(&coordinator),
+            Arc::clone(&pending_queries),
             event_rx,
             runtime.handle().clone(),
         );
@@ -226,21 +236,43 @@ impl<S: EmbeddingSpace> Worker<S> {
             max_actors,
             embedding_pool,
             global_offset,
+            n_workers,
             bootstrapping_actors: DashMap::new(),
             active_actors: DashMap::new(),
             shuttingdown_actors: DashMap::new(),
             shutdown_actors: DashMap::new(),
+            pending_queries,
         }
+    }
+
+    /// Set coordinator connection for event forwarding
+    pub async fn set_coordinator(&self, coordinator_address: String) -> Result<(), Box<dyn std::error::Error>> {
+        println!("[{}] Attempting to connect to coordinator at {}", self.worker_id, coordinator_address);
+        let addr = format!("http://{}", coordinator_address);
+        let client = CoordinatorClient::connect(addr.clone()).await
+            .map_err(|e| {
+                println!("[{}] Failed to connect to coordinator at {}: {}", self.worker_id, addr, e);
+                e
+            })?
+            .max_decoding_message_size(100 * 1024 * 1024) // 100MB
+            .max_encoding_message_size(100 * 1024 * 1024); // 100MB
+        *self.coordinator.write().unwrap() = Some(client);
+        println!("[{}] Successfully connected to coordinator at {}", self.worker_id, coordinator_address);
+        tracing::info!("Connected to coordinator at {}", coordinator_address);
+        Ok(())
     }
 
     fn spawn_event_processor_thread(
         worker_id: String,
         coordinator: Arc<RwLock<Option<CoordinatorClient<Channel>>>>,
+        pending_queries: Arc<DashMap<Uuid, oneshot::Sender<QueryResult<S>>>>,
         mut event_rx: UnboundedReceiver<ProteanEvent<S>>,
         runtime_handle: Handle,
     ) -> JoinHandle<()> {
         runtime_handle.spawn(async move {
+            println!("[{}] Event processor thread started", worker_id);
             while let Some(event) = event_rx.recv().await {
+                println!("[{}] Received event: {:?}", worker_id, event);
                 // Extract peer UUID from event
                 let peer_uuid = match &event {
                     ProteanEvent::QueryCompleted { local_uuid, .. } => *local_uuid,
@@ -256,6 +288,15 @@ impl<S: EmbeddingSpace> Worker<S> {
                 // TODO: Process event locally (update tracking maps for bootstrap/active/shutdown)
                 // Could update bootstrapping_actors, active_actors, etc. based on event type
 
+                // Handle QueryCompleted events - send results to pending queries
+                if let ProteanEvent::QueryCompleted { result, .. } = &event {
+                    // The query UUID is stored in the result
+                    if let Some((_, sender)) = pending_queries.remove(&result.query_uuid) {
+                        // Send the result to the waiting execute_query call
+                        let _ = sender.send(result.clone());
+                    }
+                }
+
                 // Forward event to coordinator if connected
                 let client_option = {
                     let guard = coordinator.read().unwrap();
@@ -263,18 +304,23 @@ impl<S: EmbeddingSpace> Worker<S> {
                 };
 
                 if let Some(mut client) = client_option {
+                    println!("[{}] Forwarding event to coordinator", worker_id);
                     // Convert event to proto
                     let event_proto = Self::event_to_proto(&event, &worker_id, &peer_uuid);
 
                     // Forward to coordinator via ForwardEvent RPC
                     match client.forward_event(Request::new(event_proto)).await {
                         Ok(_) => {
+                            println!("[{}] Successfully forwarded event to coordinator", worker_id);
                             tracing::trace!("Forwarded event to coordinator");
                         }
                         Err(e) => {
+                            println!("[{}] Failed to forward event to coordinator: {}", worker_id, e);
                             tracing::error!("Failed to forward event to coordinator: {}", e);
                         }
                     }
+                } else {
+                    println!("[{}] No coordinator connection, cannot forward event", worker_id);
                 }
             }
         })
@@ -745,8 +791,10 @@ impl<S: EmbeddingSpace> Worker<S> {
         runtime_handle: Handle,
     ) -> JoinHandle<()> {
         runtime_handle.spawn(async move {
+            tracing::info!("[Broker] Broker thread started");
             while let Some(out_msg) = remote_msg_rx.recv().await {
                 let dest_address = out_msg.destination.address.clone();
+                tracing::info!("[Broker] Routing message to {} at {}", out_msg.destination.uuid, dest_address);
 
                 let mut client = if let Some(entry) = workers.get(&dest_address) {
                     entry.value().clone()
@@ -770,6 +818,14 @@ impl<S: EmbeddingSpace> Worker<S> {
 
                 // Convert ProteanMessage to ProteanMessageProto
                 let message_proto = ProteanMessageProto::from(out_msg.message.clone());
+
+                // Log message being sent
+                tracing::debug!(
+                    "[Broker] SENDING message to peer {} at worker {}, type: {:?}",
+                    out_msg.destination.uuid,
+                    dest_address,
+                    Self::message_type_name(&out_msg.message)
+                );
 
                 let route_msg_req = tonic::Request::new(RouteMessageRequest {
                     destination_uuid: uuid_bytes,
@@ -810,30 +866,80 @@ impl<S: EmbeddingSpace> Worker<S> {
         u64::from_be_bytes(bytes[0..8].try_into().unwrap())
     }
 
+    /// Get message type name for logging
+    fn message_type_name(message: &ProteanMessage<S>) -> &'static str {
+        match message {
+            ProteanMessage::KnnRequest { .. } => "KnnRequest",
+            ProteanMessage::KnnResponse { .. } => "KnnResponse",
+            ProteanMessage::KfnRequest { .. } => "KfnRequest",
+            ProteanMessage::KfnResponse { .. } => "KfnResponse",
+            ProteanMessage::PingRequest { .. } => "PingRequest",
+            ProteanMessage::PingResponse { .. } => "PingResponse",
+        }
+    }
+
     /// Get embedding from pool by global index
+    /// Uses round-robin distribution: worker i owns indices [i, i+N, i+2N, ...]
     pub(crate) fn get_embedding(&self, global_index: u64) -> Result<S::EmbeddingData, Status> {
-        let global_offset = *self.global_offset.read().unwrap();
+        let global_offset = *self.global_offset.read().unwrap(); // This is the worker index
         let pool = self.embedding_pool.read().unwrap();
 
-        // Validate lower bound
-        if global_index < global_offset {
-            return Err(Status::invalid_argument(
-                format!("Global index {} is below this worker's offset {}",
-                    global_index, global_offset)
+        // Check if embedding pool is empty
+        if pool.is_empty() {
+            return Err(Status::internal(
+                format!("Embedding pool is empty for worker {}. Embeddings must be distributed before creating peers.",
+                    self.worker_id)
             ));
         }
 
-        // Validate upper bound
-        let max_index = global_offset + pool.len() as u64;
-        if global_index >= max_index {
+        let n_workers = self.n_workers as u64;
+
+        // Check if this global index belongs to this worker (round-robin)
+        let owner_worker_idx = global_index % n_workers;
+        if owner_worker_idx != global_offset {
             return Err(Status::invalid_argument(
-                format!("Global index {} out of range (pool range: {}-{})",
-                    global_index, global_offset, max_index - 1)
+                format!("Global index {} belongs to worker {} (this is worker {})",
+                    global_index, owner_worker_idx, global_offset)
             ));
         }
 
-        let local_index = (global_index - global_offset) as usize;
+        // Calculate local index for round-robin distribution
+        let local_index = (global_index / n_workers) as usize;
+
+        // Validate local index is within pool bounds
+        if local_index >= pool.len() {
+            return Err(Status::invalid_argument(
+                format!("Global index {} maps to local index {} which exceeds pool size {}",
+                    global_index, local_index, pool.len())
+            ));
+        }
+
         Ok(pool[local_index].clone())
+    }
+
+    /// Get any embedding from the full dataset by global index
+    /// This is used for bootstrap peer lookups where we need embeddings from other workers
+    /// All workers have the full dataset loaded (each worker loads all embeddings, but only owns a subset)
+    pub(crate) fn get_any_embedding(&self, global_index: u64) -> Result<S::EmbeddingData, Status> {
+        let pool = self.embedding_pool.read().unwrap();
+
+        // Check if embedding pool is empty
+        if pool.is_empty() {
+            return Err(Status::internal(
+                format!("Embedding pool is empty for worker {}. Embeddings must be distributed before creating peers.",
+                    self.worker_id)
+            ));
+        }
+
+        // Since all workers have the full dataset, we can directly index
+        let index = global_index as usize;
+        if index >= pool.len() {
+            return Err(Status::invalid_argument(
+                format!("Global index {} out of bounds (pool size: {})", global_index, pool.len())
+            ));
+        }
+
+        Ok(pool[index].clone())
     }
 
     async fn create_client(address: &Address) -> Result<WorkerNodeClient<Channel>, Box<dyn std::error::Error>> {
@@ -885,7 +991,7 @@ impl<S: EmbeddingSpace> Worker<S> {
         })
     }
 
-    fn parse_uuid(bytes: &[u8]) -> Result<Uuid, Status> {
+    pub fn parse_uuid(bytes: &[u8]) -> Result<Uuid, Status> {
         if bytes.len() != 64 {
             return Err(Status::invalid_argument(format!(
                 "Invalid UUID length: expected 64 bytes, got {}",
@@ -899,10 +1005,18 @@ impl<S: EmbeddingSpace> Worker<S> {
 
     async fn route_local_message(&self, dest_uuid: Uuid, message: ProteanMessage<S>) -> Result<(), Status> {
         if let Some(tx) = self.actor_protocol_channels.get(&dest_uuid) {
+            tracing::debug!(
+                "[Worker {} Router] DELIVERING message to actor {}, type: {:?}",
+                self.worker_id,
+                dest_uuid,
+                Self::message_type_name(&message)
+            );
             tx.send(message)
                 .map_err(|_| Status::internal("Failed to send message to peer"))?;
+            tracing::debug!("[Worker {} Router] Message successfully delivered to actor's channel", self.worker_id);
             Ok(())
         } else {
+            tracing::error!("[Worker {} Router] ERROR: Peer {} NOT FOUND on this worker", self.worker_id, dest_uuid);
             Err(Status::not_found(format!("Peer {} not found on this worker", dest_uuid)))
         }
     }
@@ -965,17 +1079,64 @@ impl<S: EmbeddingSpace> Worker<S> {
 
         // Bootstrap the peer if bootstrap info provided
         if let Some(bootstrap_peer) = bootstrap_peer {
+            println!("[Worker {}] Sending Bootstrap message to peer {}", self.worker_id, uuid);
+            println!("  Contact UUID: {}", bootstrap_peer.peer.uuid);
+            println!("  Contact Address: {}", bootstrap_peer.peer.address);
             let bs_msg = ControlMessage::Bootstrap {
-                contact_point: bootstrap_peer,
+                contact_point: bootstrap_peer.clone(),
                 config: Some(cloned_config.snv_config.exploration_config.clone()),
             };
 
             if let Err(e) = control_tx.send(bs_msg) {
+                println!("[Worker {}] Failed to send bootstrap message to peer {}: {:?}", self.worker_id, uuid, e);
                 tracing::error!("Failed to send bootstrap message to peer {}: {:?}", uuid, e);
+            } else {
+                println!("[Worker {}] Successfully sent Bootstrap message to peer {}", self.worker_id, uuid);
             }
+        } else {
+            println!("[Worker {}] No bootstrap peer for {}, skipping bootstrap", self.worker_id, uuid);
         }
     }
 
+    /// Gracefully shutdown all actors/peers
+    /// This should be called before dropping the worker to ensure clean shutdown
+    pub async fn shutdown(&self) {
+        println!("[Worker {}] Shutting down all actors...", self.worker_id);
+
+        // Get all peer UUIDs
+        let peer_uuids = self.local_peer_uuids();
+        println!("[Worker {}] Deleting {} actors", self.worker_id, peer_uuids.len());
+
+        // Delete all peers
+        for uuid in peer_uuids {
+            self.delete_peer(&uuid).await;
+        }
+
+        // Send stop command to churn thread
+        let _ = self.churn_tx.send(ChurnCommand::Stop);
+
+        println!("[Worker {}] All actors deleted, shutdown complete", self.worker_id);
+
+        // Note: Background threads (broker, event_processor, churn) will automatically
+        // stop when their channels close, which happens when Worker is dropped
+    }
+
+}
+
+// Implement Drop to ensure clean shutdown when Worker is dropped
+impl<S: EmbeddingSpace> Drop for Worker<S> {
+    fn drop(&mut self) {
+        println!("[Worker {}] Drop called - cleaning up background threads", self.worker_id);
+
+        // Send stop command to churn thread
+        let _ = self.churn_tx.send(ChurnCommand::Stop);
+
+        // Channels will be dropped automatically which will cause background threads to exit
+        // We don't have access to async here, so we can't wait for threads to finish,
+        // but dropping the senders will cause the receivers to return None and threads will exit
+
+        println!("[Worker {}] Drop complete", self.worker_id);
+    }
 }
 
 impl<S: EmbeddingSpace> Worker<S> {
@@ -1016,6 +1177,14 @@ impl<S: EmbeddingSpace> Worker<S> {
         // Convert ProteanMessageProto to ProteanMessage
         let message: ProteanMessage<S> = ProteanMessage::try_from(message_proto)
             .map_err(|e| Status::invalid_argument(format!("Failed to convert message: {}", e)))?;
+
+        // Log message being received
+        tracing::debug!(
+            "[Worker {} gRPC] RECEIVED message for peer {}, type: {:?}",
+            self.worker_id,
+            uuid,
+            Self::message_type_name(&message)
+        );
 
         // Route to local peer
         self.route_local_message(uuid, message).await?;
@@ -1081,25 +1250,8 @@ impl<S: EmbeddingSpace> Worker<S> {
     pub fn handle_create_peers(
         &self,
         global_indices: Vec<u64>,
-        bootstrap_index: u64,
+        bootstrap_peer_info: Option<BootstrapPeerInfo>,
     ) -> Result<Ack, Status> {
-        // Get bootstrap peer if index provided (0 = no bootstrap)
-        let bootstrap_peer = if bootstrap_index != 0 {
-            let bootstrap_uuid = Self::global_index_to_uuid(bootstrap_index);
-            let bootstrap_embedding = self.get_embedding(bootstrap_index)?;
-            let bootstrap_address = self.my_address.read().unwrap().clone();
-
-            Some(ProteanPeer {
-                embedding: bootstrap_embedding,
-                peer: Peer {
-                    uuid: bootstrap_uuid,
-                    address: bootstrap_address,
-                },
-            })
-        } else {
-            None
-        };
-
         let mut created_count = 0;
         for global_index in global_indices {
             // Convert global index to UUID
@@ -1108,8 +1260,44 @@ impl<S: EmbeddingSpace> Worker<S> {
             // Get embedding from pool
             let embedding = self.get_embedding(global_index)?;
 
+            // Determine bootstrap peer for this specific peer
+            // Don't bootstrap if this peer IS the bootstrap peer (avoid self-bootstrap)
+            let bootstrap_peer = if let Some(ref info) = bootstrap_peer_info {
+                if global_index != info.global_index {
+                    // Parse bootstrap UUID from bytes
+                    let bootstrap_uuid = Self::parse_uuid(&info.uuid)?;
+
+                    // Get bootstrap embedding - either from proto or look up locally by global_index
+                    let bootstrap_embedding = if let Some(ref embedding_proto) = info.embedding {
+                        // Old path: embedding provided in message (deprecated)
+                        Self::parse_embedding(Some(embedding_proto.clone()))?
+                    } else {
+                        // New path: look up embedding locally by global_index (much faster!)
+                        self.get_any_embedding(info.global_index)?
+                    };
+
+                    // Use the worker address from the info
+                    let bootstrap_address = info.worker_address.clone();
+
+                    Some(ProteanPeer {
+                        embedding: bootstrap_embedding,
+                        peer: Peer {
+                            uuid: bootstrap_uuid,
+                            address: bootstrap_address,
+                        },
+                    })
+                } else {
+                    // This is the bootstrap seed peer - no bootstrap needed
+                    tracing::debug!("Peer {} is the bootstrap seed, no bootstrap needed", global_index);
+                    None
+                }
+            } else {
+                // No bootstrap info provided
+                None
+            };
+
             // Spawn peer with original embedding index
-            self.spawn_peer(uuid, embedding, global_index, bootstrap_peer.clone());
+            self.spawn_peer(uuid, embedding, global_index, bootstrap_peer);
             created_count += 1;
         }
 
@@ -1117,6 +1305,67 @@ impl<S: EmbeddingSpace> Worker<S> {
             success: true,
             message: format!("Created {} peers", created_count),
         })
+    }
+
+    /// Handle bootstrap request for an existing peer
+    pub fn handle_bootstrap_peer(
+        &self,
+        peer_index: u64,
+        bootstrap_peer_info: BootstrapPeerInfo,
+    ) -> Result<Ack, Status> {
+        // Convert global index to UUID
+        let uuid = Self::global_index_to_uuid(peer_index);
+
+        // Parse bootstrap UUID from bytes
+        let bootstrap_uuid = Self::parse_uuid(&bootstrap_peer_info.uuid)?;
+
+        // Get bootstrap embedding - either from proto or look up locally by global_index
+        let bootstrap_embedding = if let Some(embedding_proto) = bootstrap_peer_info.embedding.clone() {
+            // Old path: embedding provided in message (deprecated)
+            Self::parse_embedding(Some(embedding_proto))?
+        } else {
+            // New path: look up embedding locally by global_index (much faster!)
+            self.get_any_embedding(bootstrap_peer_info.global_index)?
+        };
+
+        // Use the worker address from the info
+        let bootstrap_address = bootstrap_peer_info.worker_address.clone();
+
+        let bootstrap_peer = ProteanPeer {
+            embedding: bootstrap_embedding,
+            peer: Peer {
+                uuid: bootstrap_uuid,
+                address: bootstrap_address.clone(),
+            },
+        };
+
+        // Get the control channel for this peer
+        if let Some(control_tx) = self.actor_control_channels.get(&uuid) {
+            println!("[Worker {}] Sending Bootstrap message to peer {}
+  Contact UUID: {}
+  Contact Address: {}",
+                self.worker_id,
+                uuid,
+                bootstrap_uuid,
+                &bootstrap_address
+            );
+
+            // Send bootstrap command
+            control_tx.send(ControlMessage::Bootstrap {
+                contact_point: bootstrap_peer,
+                config: None,
+            }).map_err(|_| Status::internal("Failed to send bootstrap message to peer"))?;
+
+            println!("[Worker {}] Successfully sent Bootstrap message to peer {}",
+                self.worker_id, uuid);
+
+            Ok(Ack {
+                success: true,
+                message: format!("Bootstrapped peer {}", peer_index),
+            })
+        } else {
+            Err(Status::not_found(format!("Peer {} not found on this worker", peer_index)))
+        }
     }
 
     /// Handle peer deletion
@@ -1136,217 +1385,36 @@ impl<S: EmbeddingSpace> Worker<S> {
     }
 
     /// Handle churn pattern execution
-    pub fn handle_churn(&self, pattern: ChurnPatternType, config: ChurnConfig) -> Result<Ack, Status> {
-        let request = ChurnPatternRequest {
-            pattern: pattern.into(),
-            config: Some(config),
-        };
+    pub fn handle_churn(&self, request: ChurnPatternRequest) -> Result<Ack, Status> {
+        // Check if churn is already running
+        if self.churn_running.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Ack {
+                success: false,
+                message: "Churn pattern already running. Please wait for it to complete.".to_string(),
+            });
+        }
 
+        // Send command to churn thread
         self.churn_tx
             .send(ChurnCommand::Start(request))
-            .map_err(|_| Status::internal("Failed to send churn command"))?;
+            .map_err(|_| Status::internal("Churn thread not available"))?;
 
         Ok(Ack {
             success: true,
-            message: format!("Churn pattern {:?} initiated", pattern),
+            message: "Churn pattern started".to_string(),
         })
     }
-}
 
-// WorkerNode gRPC trait implementation
-
-#[tonic::async_trait]
-impl<S: EmbeddingSpace + Send + Sync + 'static> WorkerNode for Worker<S>
-where
-    S::EmbeddingData: Send + Sync,
-{
-    // 1. Ping - Health check
-    async fn ping(
+    /// Handle query execution on a specific peer
+    pub async fn handle_execute_query(
         &self,
-        _request: Request<PingRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        Ok(Response::new(self.handle_ping()))
-    }
-
-    // 2. RegisterWorker - Add connection to another worker
-    async fn register_worker(
-        &self,
-        request: Request<WorkerInfo>,
-    ) -> Result<Response<Ack>, Status> {
-        let worker_info = request.into_inner();
-        let address = worker_info.address;
-
-        if self.add_worker_connection(address.clone()).await {
-            Ok(Response::new(Ack {
-                success: true,
-                message: format!("Registered worker at {}", address),
-            }))
-        } else {
-            Ok(Response::new(Ack {
-                success: false,
-                message: format!("Failed to connect to worker at {}", address),
-            }))
-        }
-    }
-
-    // 3. RouteMessage - Route message to local peer
-    async fn route_message(
-        &self,
-        request: Request<RouteMessageRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-
-        // Parse UUID
-        let uuid = Self::parse_uuid(&req.destination_uuid)?;
-
-        // Convert ProteanMessageProto to ProteanMessage
-        let message_proto = req.message
-            .ok_or_else(|| Status::invalid_argument("Missing message field"))?;
-        let message: ProteanMessage<S> = ProteanMessage::try_from(message_proto)
-            .map_err(|e| Status::invalid_argument(format!("Failed to convert message: {}", e)))?;
-
-        // Route to local peer
-        self.route_local_message(uuid, message).await?;
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: "Message routed".to_string(),
-        }))
-    }
-
-    // 4. SetConfig - Store configuration
-    async fn set_config(
-        &self,
-        request: Request<SimConfigProto>,
-    ) -> Result<Response<Ack>, Status> {
-        let config_proto = request.into_inner();
-
-        // Store config
-        *self.config.write().unwrap() = Some(config_proto.clone());
-
-        // Update actor_config from proto config
-        let protean_config = Self::config_proto_to_protean_config(&config_proto)?;
-        *self.actor_config.write().unwrap() = protean_config;
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: "Configuration set successfully".to_string(),
-        }))
-    }
-
-    // LoadEmbeddings - Load embedding pool from coordinator
-    async fn load_embeddings(
-        &self,
-        request: Request<LoadEmbeddingsRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-
-        // Set global offset
-        *self.global_offset.write().unwrap() = req.global_offset;
-
-        // Clear existing pool and parse new embeddings
-        let mut pool = self.embedding_pool.write().unwrap();
-        pool.clear();
-
-        for tensor_proto in req.embeddings {
-            let embedding = Self::parse_embedding(Some(tensor_proto))?;
-            pool.push(embedding);
-        }
-
-        let count = pool.len();
-        drop(pool); // Release lock
-
-        tracing::info!(
-            "Loaded {} embeddings starting at global index {}",
-            count,
-            req.global_offset
-        );
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: format!(
-                "Loaded {} embeddings starting at global index {}",
-                count, req.global_offset
-            ),
-        }))
-    }
-
-    // 5. CreatePeers - Spawn multiple peers using global indices
-    async fn create_peers(
-        &self,
-        request: Request<CreatePeersRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-
-        // Get bootstrap peer if index provided (0 = no bootstrap)
-        let bootstrap_peer = if req.bootstrap_index != 0 {
-            let bootstrap_uuid = Self::global_index_to_uuid(req.bootstrap_index);
-            let bootstrap_embedding = self.get_embedding(req.bootstrap_index)?;
-            let bootstrap_address = self.my_address.read().unwrap().clone();
-
-            Some(ProteanPeer {
-                embedding: bootstrap_embedding,
-                peer: Peer {
-                    uuid: bootstrap_uuid,
-                    address: bootstrap_address,
-                },
-            })
-        } else {
-            None
-        };
-
-        let mut created_count = 0;
-        for global_index in req.global_indices {
-            // Convert global index to UUID
-            let uuid = Self::global_index_to_uuid(global_index);
-
-            // Get embedding from pool
-            let embedding = self.get_embedding(global_index)?;
-
-            // Spawn peer with original embedding index
-            self.spawn_peer(uuid, embedding, global_index, bootstrap_peer.clone());
-            created_count += 1;
-        }
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: format!("Created {} peers", created_count),
-        }))
-    }
-
-    // 6. DeletePeers - Remove peers using global indices
-    async fn delete_peers(
-        &self,
-        request: Request<DeletePeersRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-
-        let mut deleted_count = 0;
-        for global_index in req.global_indices {
-            // Convert global index to UUID
-            let uuid = Self::global_index_to_uuid(global_index);
-
-            // Delete peer
-            if self.delete_peer(&uuid).await {
-                deleted_count += 1;
-            }
-        }
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: format!("Deleted {} peers", deleted_count),
-        }))
-    }
-
-    // 7. ExecuteQuery - Start query on a peer
-    async fn execute_query(
-        &self,
-        request: Request<QueryRequest>,
-    ) -> Result<Response<QueryResponse>, Status> {
-        let req = request.into_inner();
-
+        source_peer_uuid: &[u8],
+        query_embedding: Option<TensorProto>,
+        k: u32,
+        config: Option<QueryConfigProto>,
+    ) -> Result<QueryResponse, Status> {
         // Parse peer UUID
-        let peer_uuid = Self::parse_uuid(&req.source_peer_uuid)?;
+        let peer_uuid = Self::parse_uuid(source_peer_uuid)?;
 
         // Get control channel for this peer
         let control_tx = self.actor_control_channels.get(&peer_uuid)
@@ -1354,49 +1422,78 @@ where
             .clone();
 
         // Parse query embedding and config
-        let query_embedding = Self::parse_embedding(req.query_embedding)?;
-        let k = req.k as usize;
-        let config = Self::parse_query_config(req.config);
+        let query_embedding = Self::parse_embedding(query_embedding)?;
+        let k = k as usize;
+        let config = Self::parse_query_config(config);
 
-        // Create oneshot channel for response
-        let (response_tx, response_rx) = oneshot::channel();
+        // Create oneshot channel for query UUID
+        let (uuid_tx, uuid_rx) = oneshot::channel();
 
         // Send query command to peer
         let query_msg = ControlMessage::Query {
             embedding: query_embedding,
             k,
             config,
-            response: response_tx,
+            response: uuid_tx,
         };
 
         control_tx.send(query_msg)
             .map_err(|_| Status::internal("Failed to send query"))?;
 
         // Await query UUID from peer
-        let query_uuid = response_rx.await
+        let query_uuid = uuid_rx.await
             .map_err(|_| Status::internal("Failed to receive query UUID"))?
             .ok_or_else(|| Status::internal("Peer rejected query"))?;
 
-        Ok(Response::new(QueryResponse {
+        // Create oneshot channel for query result and register it
+        let (result_tx, result_rx) = oneshot::channel();
+        self.pending_queries.insert(query_uuid, result_tx);
+
+        // Wait for query to complete (with timeout)
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            result_rx
+        ).await
+            .map_err(|_| Status::deadline_exceeded("Query timed out"))?
+            .map_err(|_| Status::internal("Failed to receive query result"))?;
+
+        // Convert result to QueryResponse proto
+        let results: Vec<QueryCandidateProto> = result.candidates
+            .iter()
+            .map(|candidate| {
+                // Convert embedding to TensorProto
+                let embedding_proto: TensorProto = candidate.protean_peer.embedding.clone().into();
+
+                QueryCandidateProto {
+                    peer: Some(PeerProto {
+                        embedding: Some(embedding_proto),
+                        uuid: candidate.protean_peer.peer.uuid.as_bytes().to_vec(),
+                        address: candidate.protean_peer.peer.address.clone(),
+                    }),
+                    distance: Some(candidate.distance.into()),
+                }
+            })
+            .collect();
+
+        Ok(QueryResponse {
             query_uuid: query_uuid.as_bytes().to_vec(),
-            results: vec![],
-            hops: 0,
-            latency_ms: 0,
+            results,
+            hops: 0, // Not tracked in QueryResult
+            latency_ms: 0, // Not tracked in QueryResult (could be calculated from start time if needed)
             success: true,
             error_message: String::new(),
-        }))
+        })
     }
 
-    // 8. TrueQuery - Brute-force k-NN
-    async fn true_query(
+    /// Handle brute-force k-NN query across all peers
+    pub async fn handle_true_query(
         &self,
-        request: Request<QueryRequest>,
-    ) -> Result<Response<QueryResponse>, Status> {
-        let req = request.into_inner();
-
+        query_embedding: Option<TensorProto>,
+        k: u32,
+    ) -> Result<QueryResponse, Status> {
         // Parse query embedding
-        let query_embedding = Self::parse_embedding(req.query_embedding)?;
-        let k = req.k as usize;
+        let query_embedding = Self::parse_embedding(query_embedding)?;
+        let k = k as usize;
 
         // Get all peer UUIDs
         let peer_uuids = self.local_peer_uuids();
@@ -1443,28 +1540,26 @@ where
         // Generate a unique query UUID from the query embedding
         let query_uuid = Uuid::from_embedding::<S>(&query_embedding);
 
-        Ok(Response::new(QueryResponse {
+        Ok(QueryResponse {
             query_uuid: query_uuid.as_bytes().to_vec(),
             results,
             hops: 0,
             latency_ms: 0,
             success: true,
             error_message: String::new(),
-        }))
+        })
     }
 
-    // 9. GetSnapshot - Collect SNV snapshots
-    async fn get_snapshot(
+    /// Handle getting network snapshot
+    pub async fn handle_get_snapshot(
         &self,
-        request: Request<SnapshotRequest>,
-    ) -> Result<Response<NetworkSnapshot>, Status> {
-        let req = request.into_inner();
-
+        peer_uuids: Vec<Vec<u8>>,
+    ) -> Result<NetworkSnapshot, Status> {
         // Get peer UUIDs - either from request or all local peers
-        let peer_uuids = if req.peer_uuids.is_empty() {
+        let peer_uuids = if peer_uuids.is_empty() {
             self.local_peer_uuids()
         } else {
-            req.peer_uuids.iter()
+            peer_uuids.iter()
                 .map(|bytes| Self::parse_uuid(bytes))
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -1515,16 +1610,14 @@ where
             peer_snapshots: snapshots,
         };
 
-        Ok(Response::new(snapshot))
+        Ok(snapshot)
     }
 
-    // 10. LoadSnapshot - Restore network state
-    async fn load_snapshot(
+    /// Handle loading network snapshot
+    pub async fn handle_load_snapshot(
         &self,
-        request: Request<NetworkSnapshot>,
-    ) -> Result<Response<Ack>, Status> {
-        let snapshot = request.into_inner();
-
+        snapshot: NetworkSnapshot,
+    ) -> Result<Ack, Status> {
         // Clear all existing peers
         let existing_uuids = self.local_peer_uuids();
         for uuid in existing_uuids {
@@ -1565,43 +1658,160 @@ where
             }
         }
 
-        Ok(Response::new(Ack {
+        Ok(Ack {
             success: true,
             message: format!("Restored {} peers from snapshot", restored_count),
-        }))
+        })
+    }
+}
+
+// WorkerNode gRPC trait implementation
+
+#[tonic::async_trait]
+impl<S: EmbeddingSpace + Send + Sync + 'static> WorkerNode for Worker<S>
+where
+    S::EmbeddingData: Send + Sync,
+{
+    // 1. Ping - Health check
+    async fn ping(
+        &self,
+        _request: Request<PingRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        Ok(Response::new(self.handle_ping()))
     }
 
-    // 11. Churn - Apply churn pattern
+    // 2. RegisterWorker - Add connection to another worker
+    async fn register_worker(
+        &self,
+        request: Request<WorkerInfo>,
+    ) -> Result<Response<Ack>, Status> {
+        let worker_info = request.into_inner();
+        let ack = self.handle_register_worker(worker_info.address).await;
+        Ok(Response::new(ack))
+    }
+
+    // 3. RouteMessage - Route message to local peer
+    async fn route_message(
+        &self,
+        request: Request<RouteMessageRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let message_proto = req.message
+            .ok_or_else(|| Status::invalid_argument("Missing message field"))?;
+        let ack = self.handle_route_message(&req.destination_uuid, message_proto).await?;
+        Ok(Response::new(ack))
+    }
+
+    // 4. SetConfig - Store configuration
+    async fn set_config(
+        &self,
+        request: Request<SimConfigProto>,
+    ) -> Result<Response<Ack>, Status> {
+        let config_proto = request.into_inner();
+        let ack = self.handle_set_config(config_proto)?;
+        Ok(Response::new(ack))
+    }
+
+    // LoadEmbeddings - Load embedding pool from coordinator
+    async fn load_embeddings(
+        &self,
+        request: Request<LoadEmbeddingsRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let ack = self.handle_load_embeddings(req.global_offset, req.embeddings)?;
+        Ok(Response::new(ack))
+    }
+
+    // 5. CreatePeers - Spawn multiple peers using global indices
+    async fn create_peers(
+        &self,
+        request: Request<CreatePeersRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        println!("[{} gRPC] Received create_peers request: indices={:?}, has_bootstrap_peer={}",
+            self.worker_id, req.global_indices, req.bootstrap_peer.is_some());
+        let ack = self.handle_create_peers(req.global_indices, req.bootstrap_peer)?;
+        println!("[{} gRPC] create_peers completed: {}", self.worker_id, ack.message);
+        Ok(Response::new(ack))
+    }
+
+    // BootstrapPeer - Bootstrap an existing peer
+    async fn bootstrap_peer(
+        &self,
+        request: Request<BootstrapPeerRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        println!("[Worker {} gRPC] Received bootstrap_peer RPC: peer_index={}, has_bootstrap_peer={}",
+                 self.worker_id, req.peer_index, req.bootstrap_peer.is_some());
+        let bootstrap_peer = req.bootstrap_peer
+            .ok_or_else(|| Status::invalid_argument("Missing bootstrap_peer field"))?;
+        let ack = self.handle_bootstrap_peer(req.peer_index, bootstrap_peer)?;
+        println!("[Worker {} gRPC] bootstrap_peer RPC completed successfully", self.worker_id);
+        Ok(Response::new(ack))
+    }
+
+    // 6. DeletePeers - Remove peers using global indices
+    async fn delete_peers(
+        &self,
+        request: Request<DeletePeersRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let ack = self.handle_delete_peers(req.global_indices).await?;
+        Ok(Response::new(ack))
+    }
+
+    // 7. ExecuteQuery - Start query on a peer
+    async fn execute_query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        let response = self.handle_execute_query(
+            &req.source_peer_uuid,
+            req.query_embedding,
+            req.k,
+            req.config,
+        ).await?;
+        Ok(Response::new(response))
+    }
+
+    // 8. TrueQuery - Brute-force k-NN
+    async fn true_query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        let response = self.handle_true_query(req.query_embedding, req.k).await?;
+        Ok(Response::new(response))
+    }
+
+    // 9. GetSnapshot - Collect SNV snapshots
+    async fn get_snapshot(
+        &self,
+        request: Request<SnapshotRequest>,
+    ) -> Result<Response<NetworkSnapshot>, Status> {
+        let req = request.into_inner();
+        let snapshot = self.handle_get_snapshot(req.peer_uuids).await?;
+        Ok(Response::new(snapshot))
+    }
+
+    // 10. LoadSnapshot - Restore network state
+    async fn load_snapshot(
+        &self,
+        request: Request<NetworkSnapshot>,
+    ) -> Result<Response<Ack>, Status> {
+        let snapshot = request.into_inner();
+        let ack = self.handle_load_snapshot(snapshot).await?;
+        Ok(Response::new(ack))
+    }
+
     // 11. Churn - Apply churn pattern
     async fn churn(
         &self,
         request: Request<ChurnPatternRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-
-        // Check if churn is already running
-        if self.churn_running.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Response::new(Ack {
-                success: false,
-                message: "Churn pattern already running. Please wait for it to complete.".to_string(),
-            }));
-        }
-
-        // Validate pattern (EMBEDDING_DRIFT not supported)
-        if req.pattern() == ChurnPatternType::EmbeddingDrift {
-            return Ok(Response::new(Ack {
-                success: false,
-                message: "EMBEDDING_DRIFT pattern not yet implemented".to_string(),
-            }));
-        }
-
-        // Send command to churn thread
-        self.churn_tx.send(ChurnCommand::Start(req))
-            .map_err(|_| Status::internal("Churn thread not available"))?;
-
-        Ok(Response::new(Ack {
-            success: true,
-            message: "Churn pattern started".to_string(),
-        }))
+        let ack = self.handle_churn(req)?;
+        Ok(Response::new(ack))
     }
 }

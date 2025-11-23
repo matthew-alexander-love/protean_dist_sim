@@ -1,0 +1,57 @@
+---
+# Coordinator Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: protean
+  labels:
+    app: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app: coordinator
+  ports:
+  - name: grpc
+    port: 50050
+    targetPort: 50050
+    protocol: TCP
+
+---
+# Headless Service for Workers (for StatefulSet)
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: protean
+  labels:
+    app: worker
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service
+  selector:
+    app: worker
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: 50051
+    protocol: TCP
+
+---
+# Optional: LoadBalancer for external access to coordinator
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-external
+  namespace: protean
+  labels:
+    app: coordinator
+spec:
+  type: LoadBalancer
+  selector:
+    app: coordinator
+  ports:
+  - name: grpc
+    port: 50050
+    targetPort: 50050
+    protocol: TCP

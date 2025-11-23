@@ -4,7 +4,7 @@ use super::helpers::*;
 use crate::proto::dist_sim::*;
 use crate::worker::worker::Worker;
 use protean::embedding_space::spaces::f32_l2::F32L2Space;
-use tonic::Request;
+use protean::uuid::Uuid;
 
 type TestSpace = F32L2Space<4>;
 
@@ -18,7 +18,7 @@ mod helper_tests {
 
     #[test]
     fn test_parse_uuid_valid() {
-        let uuid = Uuid::new_v4();
+        let uuid = Uuid::from_data(12345u64);
         let bytes = uuid.as_bytes();
         let parsed = Worker::<TestSpace>::parse_uuid(bytes).unwrap();
         assert_eq!(parsed, uuid);
@@ -72,10 +72,12 @@ mod rpc_simple_tests {
     #[tokio::test]
     async fn test_register_worker_rpc() {
         let worker = create_test_worker();
+        // Try to register a non-existent worker - should fail
         let ack = worker.handle_register_worker("127.0.0.1:8081".to_string()).await;
 
-        assert!(ack.success);
-        assert!(ack.message.contains("Registered"));
+        // Connection should fail since no worker is actually running at that address
+        assert!(!ack.success);
+        assert!(ack.message.contains("Failed"));
     }
 
     #[tokio::test]
@@ -89,23 +91,20 @@ mod rpc_simple_tests {
             region: "us-east-1".to_string(),
         };
 
-        let request = Request::new(config);
-        let response = worker.set_config(request).await.unwrap();
-        let ack = response.into_inner();
+        let ack = worker.handle_set_config(config).unwrap();
 
         assert!(ack.success);
     }
 
     #[tokio::test]
-    async fn test_churn_rpc_not_implemented() {
+    async fn test_churn_rpc() {
         let worker = create_test_worker();
-        let request = Request::new(ChurnPatternRequest::default());
+        let request = ChurnPatternRequest::default();
 
-        let response = worker.churn(request).await.unwrap();
-        let ack = response.into_inner();
+        let ack = worker.handle_churn(request).unwrap();
 
-        assert!(!ack.success);
-        assert!(ack.message.contains("not yet implemented"));
+        assert!(ack.success);
+        assert!(ack.message.contains("started"));
     }
 }
 
@@ -126,20 +125,10 @@ mod rpc_peer_management_tests {
             create_test_embedding_proto(vec![1.0, 0.0, 0.0, 0.0]),
             create_test_embedding_proto(vec![0.0, 1.0, 0.0, 0.0]),
         ];
-        let load_req = Request::new(LoadEmbeddingsRequest {
-            global_offset: 100,
-            embeddings,
-        });
-        worker.load_embeddings(load_req).await.unwrap();
+        worker.handle_load_embeddings(100, embeddings).unwrap();
 
         // Create peers using global indices
-        let request = Request::new(CreatePeersRequest {
-            global_indices: vec![100, 101],
-            bootstrap_index: 0, // No bootstrap
-        });
-
-        let response = worker.create_peers(request).await.unwrap();
-        let ack = response.into_inner();
+        let ack = worker.handle_create_peers(vec![100, 101], None).unwrap();
 
         assert!(ack.success);
         assert!(ack.message.contains("2"));
@@ -154,29 +143,16 @@ mod rpc_peer_management_tests {
 
         // Load embeddings first
         let embeddings = vec![create_test_embedding_proto(vec![1.0, 0.0, 0.0, 0.0])];
-        let load_req = Request::new(LoadEmbeddingsRequest {
-            global_offset: 100,
-            embeddings,
-        });
-        worker.load_embeddings(load_req).await.unwrap();
+        worker.handle_load_embeddings(100, embeddings).unwrap();
 
         // Create a peer using global index
-        let create_req = Request::new(CreatePeersRequest {
-            global_indices: vec![100],
-            bootstrap_index: 0,
-        });
-        worker.create_peers(create_req).await.unwrap();
+        worker.handle_create_peers(vec![100], None).unwrap();
 
         // Verify peer was created
         assert_eq!(worker.local_peer_uuids().len(), 1);
 
         // Now delete it using global index
-        let delete_req = Request::new(DeletePeersRequest {
-            global_indices: vec![100],
-        });
-
-        let response = worker.delete_peers(delete_req).await.unwrap();
-        let ack = response.into_inner();
+        let ack = worker.handle_delete_peers(vec![100]).await.unwrap();
 
         assert!(ack.success);
         assert!(ack.message.contains("1"));
@@ -200,32 +176,21 @@ mod rpc_query_tests {
 
         // Load embeddings
         let embeddings = vec![create_test_embedding_proto(vec![1.0, 0.0, 0.0, 0.0])];
-        let load_req = Request::new(LoadEmbeddingsRequest {
-            global_offset: 100,
-            embeddings,
-        });
-        worker.load_embeddings(load_req).await.unwrap();
+        worker.handle_load_embeddings(100, embeddings).unwrap();
 
         // Create a peer using global index
-        let create_req = Request::new(CreatePeersRequest {
-            global_indices: vec![100],
-            bootstrap_index: 0,
-        });
-        worker.create_peers(create_req).await.unwrap();
+        worker.handle_create_peers(vec![100], None).unwrap();
 
         // Get the peer UUID (generated from global index)
         let peer_uuid = Worker::<TestSpace>::global_index_to_uuid(100);
 
         // Execute query
-        let query_req = Request::new(QueryRequest {
-            source_peer_uuid: peer_uuid.as_bytes().to_vec(),
-            query_embedding: Some(create_known_embedding(0.5, 0.5, 0.5, 0.5)),
-            k: 5,
-            config: None,
-        });
-
-        let response = worker.execute_query(query_req).await.unwrap();
-        let query_response = response.into_inner();
+        let query_response = worker.handle_execute_query(
+            peer_uuid.as_bytes(),
+            Some(create_known_embedding(0.5, 0.5, 0.5, 0.5)),
+            5,
+            None,
+        ).await.unwrap();
 
         assert!(query_response.success);
         assert!(!query_response.query_uuid.is_empty());
@@ -241,29 +206,16 @@ mod rpc_query_tests {
             create_test_embedding_proto(vec![0.0, 1.0, 0.0, 0.0]),
             create_test_embedding_proto(vec![0.0, 0.0, 1.0, 0.0]),
         ];
-        let load_req = Request::new(LoadEmbeddingsRequest {
-            global_offset: 100,
-            embeddings,
-        });
-        worker.load_embeddings(load_req).await.unwrap();
+        worker.handle_load_embeddings(100, embeddings).unwrap();
 
         // Create multiple peers using global indices
-        let create_req = Request::new(CreatePeersRequest {
-            global_indices: vec![100, 101, 102],
-            bootstrap_index: 0,
-        });
-        worker.create_peers(create_req).await.unwrap();
+        worker.handle_create_peers(vec![100, 101, 102], None).unwrap();
 
         // Execute true query
-        let query_req = Request::new(QueryRequest {
-            source_peer_uuid: vec![], // Not used in true query
-            query_embedding: Some(create_known_embedding(1.0, 0.1, 0.1, 0.1)),
-            k: 2,
-            config: None,
-        });
-
-        let response = worker.true_query(query_req).await.unwrap();
-        let query_response = response.into_inner();
+        let query_response = worker.handle_true_query(
+            Some(create_known_embedding(1.0, 0.1, 0.1, 0.1)),
+            2,
+        ).await.unwrap();
 
         assert!(query_response.success);
         assert_eq!(query_response.results.len(), 2);
@@ -273,14 +225,14 @@ mod rpc_query_tests {
     async fn test_execute_query_peer_not_found() {
         let worker = create_test_worker();
 
-        let query_req = Request::new(QueryRequest {
-            source_peer_uuid: Uuid::new_v4().as_bytes().to_vec(),
-            query_embedding: Some(create_known_embedding(0.5, 0.5, 0.5, 0.5)),
-            k: 5,
-            config: None,
-        });
+        let random_uuid = Uuid::from_data(99999u64);
+        let result = worker.handle_execute_query(
+            random_uuid.as_bytes(),
+            Some(create_known_embedding(0.5, 0.5, 0.5, 0.5)),
+            5,
+            None,
+        ).await;
 
-        let result = worker.execute_query(query_req).await;
         assert!(result.is_err());
     }
 }
@@ -299,28 +251,15 @@ mod rpc_snapshot_tests {
 
         // Load embeddings and create a peer
         let embeddings = vec![create_test_embedding_proto(vec![1.0, 0.0, 0.0, 0.0])];
-        let load_req = Request::new(LoadEmbeddingsRequest {
-            global_offset: 100,
-            embeddings,
-        });
-        worker.load_embeddings(load_req).await.unwrap();
+        worker.handle_load_embeddings(100, embeddings).unwrap();
 
-        let create_req = Request::new(CreatePeersRequest {
-            global_indices: vec![100],
-            bootstrap_index: 0,
-        });
-        worker.create_peers(create_req).await.unwrap();
+        worker.handle_create_peers(vec![100], None).unwrap();
 
         // Get snapshot
-        let snapshot_req = Request::new(SnapshotRequest {
-            peer_uuids: vec![],
-        });
-
-        let response = worker.get_snapshot(snapshot_req).await.unwrap();
-        let snapshot = response.into_inner();
+        let snapshot = worker.handle_get_snapshot(vec![]).await.unwrap();
 
         assert_eq!(snapshot.worker_id, "test-worker-1");
-        assert!(snapshot.timestamp > 0);
+        assert!(snapshot.timestamp_ms > 0);
     }
 
     #[tokio::test]
@@ -329,15 +268,12 @@ mod rpc_snapshot_tests {
 
         // Create empty snapshot
         let snapshot = NetworkSnapshot {
-            timestamp: 123456,
+            timestamp_ms: 123456,
             worker_id: "test-worker-1".to_string(),
-            snapshots: vec![],
-            ..Default::default()
+            peer_snapshots: vec![],
         };
 
-        let request = Request::new(snapshot);
-        let response = worker.load_snapshot(request).await.unwrap();
-        let ack = response.into_inner();
+        let ack = worker.handle_load_snapshot(snapshot).await.unwrap();
 
         assert!(ack.success);
     }
@@ -353,14 +289,19 @@ mod rpc_routing_tests {
 
     #[tokio::test]
     async fn test_route_message_peer_not_found() {
+        use crate::proto::protean::ProteanMessageProto;
+
         let worker = create_test_worker();
 
-        let route_req = Request::new(RouteMessageRequest {
-            destination_uuid: Uuid::new_v4().as_bytes().to_vec(),
-            message: Some(vec![1, 2, 3]),
-        });
+        // Create a minimal valid message (content doesn't matter since peer doesn't exist)
+        let message = ProteanMessageProto::default();
+        let random_uuid = Uuid::from_data(99999u64);
 
-        let result = worker.route_message(route_req).await;
+        let result = worker.handle_route_message(
+            random_uuid.as_bytes(),
+            message,
+        ).await;
+
         // Should fail because peer doesn't exist
         assert!(result.is_err());
     }

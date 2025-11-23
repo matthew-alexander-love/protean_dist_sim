@@ -211,15 +211,35 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
     }
 
     fn process_message(&mut self, msg: ProteanMessage<S>) {
+        tracing::info!("[Actor {}] Received protocol message: {:?}", self.protean.uuid(), msg);
         // Check drift before processing message
         self.update_drift_if_needed();
 
         let step = self.protean.event(msg);
+        tracing::info!("[Actor {}] After processing message: {} messages, {} events",
+            self.protean.uuid(), step.messages().len(), step.events().len());
         self.route_messages(step.messages());
 
         for event in step.events() {
+            println!("[Actor {}] Event from message processing: {:?}", self.protean.uuid(), event);
             if let Err(e) = self.event_tx.send(event.clone()) {
                 tracing::error!("Failed to send event: {:?}", e);
+                println!("[Actor {}] ERROR sending event: {:?}", self.protean.uuid(), e);
+            } else {
+                println!("[Actor {}] Event sent successfully", self.protean.uuid());
+            }
+        }
+
+        // CRITICAL: Call step() after processing message to progress query state machine.
+        // This generates follow-up KNN/KFN requests, triggers occlusion pruning, and ensures
+        // queries don't stall waiting for the periodic timer (which gets reset on each message).
+        let post_step = self.protean.step();
+        if !post_step.messages().is_empty() || !post_step.events().is_empty() {
+            println!("[Actor {}] Post-message step: {} messages, {} events",
+                self.protean.uuid(), post_step.messages().len(), post_step.events().len());
+            self.route_messages(post_step.messages());
+            for event in post_step.events() {
+                let _ = self.event_tx.send(event.clone());
             }
         }
     }
@@ -235,13 +255,17 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
 
         match msg {
             ControlMessage::Bootstrap { contact_point, config } => {
+                tracing::debug!("[Actor {}] Received Bootstrap command, contact: {}", self.protean.uuid(), contact_point.peer.uuid);
                 let success = self.protean.bootstrap(contact_point, config);
+                println!("[Actor {}] Bootstrap result: {}", self.protean.uuid(), success);
                 if success {
                     // Bootstrap started, step to get initial messages
                     let step = self.protean.step();
+                    tracing::trace!("[Actor {}] Bootstrap step: {} messages, {} events", self.protean.uuid(), step.messages().len(), step.events().len());
                     self.route_messages(step.messages());
 
                     for event in step.events() {
+                        println!("[Actor {}] Sending event from bootstrap step: {:?}", self.protean.uuid(), event);
                         let _ = self.event_tx.send(event.clone());
                     }
                 }
@@ -322,11 +346,20 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
         let has_messages = !step.messages().is_empty();
         let has_events = !step.events().is_empty();
 
+        if has_messages || has_events {
+            println!("[Actor {}] Auto-step: {} messages, {} events",
+                self.protean.uuid(), step.messages().len(), step.events().len());
+        }
+
         self.route_messages(step.messages());
 
         for event in step.events() {
+            println!("[Actor {}] Auto-step generated event: {:?}", self.protean.uuid(), event);
             if let Err(e) = self.event_tx.send(event.clone()) {
                 tracing::error!("Failed to send event: {:?}", e);
+                println!("[Actor {}] ERROR sending event: {:?}", self.protean.uuid(), e);
+            } else {
+                println!("[Actor {}] Event sent to event_tx successfully", self.protean.uuid());
             }
         }
 
@@ -410,10 +443,14 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
     fn route_messages(&self, msgs: &[OutMessage<S>]) {
         for outgoing in msgs {
             if &outgoing.destination.address == self.protean.address() {
+                // Local routing
                 if let Some(channel) = self.peer_channels.get(&outgoing.destination.uuid) {
                     let _ = channel.send(outgoing.message.clone());
                 }
             } else {
+                // Remote routing (cross-worker)
+                tracing::info!("[Actor {}] Sending REMOTE message to {} at {}",
+                    self.protean.uuid(), outgoing.destination.uuid, outgoing.destination.address);
                 let _ = self.remote_msg_tx.send(outgoing.clone());
             }
         }

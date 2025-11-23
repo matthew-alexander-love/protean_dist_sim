@@ -1,0 +1,84 @@
+# Test Plan for Docker Deployment
+# Smaller scale test suitable for initial deployment and validation
+
+# Total number of peers for this test
+peer_count: 10000
+
+phases:
+  # Phase 1: Bootstrap initial network
+  - type: Bootstrap
+    peer_indices:
+      start: 0
+      end: 9000
+    bootstrap_index: 0  # All peers bootstrap to peer 0
+
+  # Phase 2: Wait for bootstrap to stabilize
+  - type: Wait
+    duration_ms: 5000
+
+  # Phase 3: Take snapshot of initial network
+  - type: Snapshot
+    output_path: "initial_network.json"
+
+  # Phase 4: Execute test queries
+  - type: Query
+    query_indices: [10000, 10001, 10002, 10003, 10004]
+    source_peer_indices: [0, 120, 2530, 3032, 4032]
+    k: 10
+
+  # Phase 5: Flash crowd churn test
+  - type: Churn
+    pattern: FlashCrowd
+    global_indices:
+      start: 9001
+      end: 9999
+    bootstrap_indices: [0]
+    duration_ms: 10000
+    rate_per_second: 2.5
+
+  # Phase 6: Wait for churn to complete
+  - type: Wait
+    duration_ms: 10000
+
+  # Phase 7: Post-churn snapshot
+  - type: Snapshot
+    output_path: "after_flash_crowd_churn.json"
+
+  # Phase 10: Final queries
+  - type: Query
+    query_indices: [10005, 10006, 10007, 10008, 10009]
+    source_peer_indices: [9030, 91230, 9230, 9302, 9003]
+    k: 10
+
+  # Phase 11: Mixed churn - gradual departures
+  - type: Churn
+    pattern: GradualLeave
+    global_indices:
+      start: 5000
+      end: 5499
+    duration_ms: 8000
+    rate_per_second: 62.5  # 500 peers over 8 seconds
+
+  # Phase 12: Mixed churn - gradual joins
+  - type: Churn
+    pattern: GradualJoin
+    global_indices:
+      start: 10000
+      end: 10499
+    bootstrap_indices: [0, 1000, 2000, 3000, 4000]
+    duration_ms: 8000
+    rate_per_second: 62.5  # 500 peers over 8 seconds
+
+  # Phase 13: Wait for network to stabilize after churn
+  - type: Wait
+    duration_ms: 5000
+
+  # Phase 14: Query from newly joined peers
+  - type: Query
+    query_indices: [10010, 10011, 10012, 10013, 10014]
+    source_peer_indices: [10000, 10100, 10200, 10300, 10400]
+    k: 10
+
+  # Phase 15: Final snapshot
+  - type: Snapshot
+    output_path: "final_network.json"

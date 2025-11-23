@@ -1,0 +1,102 @@
+# Coordinator Configuration for Docker Deployment
+# This config is optimized for containerized environments
+
+# List of workers to coordinate (uses Docker service names)
+workers:
+  - worker_id: "worker0"
+    address: "worker0:50051"
+
+  - worker_id: "worker1"
+    address: "worker1:50051"
+
+  - worker_id: "worker2"
+    address: "worker2:50051"
+
+  - worker_id: "worker3"
+    address: "worker3:50051"
+
+  - worker_id: "worker4"
+    address: "worker4:50051"
+
+  - worker_id: "worker5"
+    address: "worker5:50051"
+
+  - worker_id: "worker6"
+    address: "worker6:50051"
+
+  - worker_id: "worker7"
+    address: "worker7:50051"
+
+  - worker_id: "worker8"
+    address: "worker8:50051"
+
+  - worker_id: "worker9"
+    address: "worker9:50051"
+
+  - worker_id: "worker10"
+    address: "worker10:50051"
+
+# Dataset configuration
+dataset:
+  # Paths are relative to container mount points
+  base_path: "/app/data/sift_base.fvecs"
+  query_path: "/app/data/sift_query.fvecs"
+
+# Simulation configuration
+sim_config:
+  # Maximum number of peers per worker
+  max_peers: 1000
+
+  # Region identifier for GCP deployment
+  region: "us-central1"
+
+  # SNV (Sparse Neighbor View) configuration
+  snv_config:
+    # Maximum concurrent operations
+    concurrency_limit: 5
+
+    # Timeout for operations (milliseconds)
+    timeout_ms: 5000
+
+    # Occlusion threshold for neighbor selection (0.0 - 1.0)
+    occlusion_threshold: 0.5
+
+    # Drift detection threshold (0.0 - 1.0)
+    drift_threshold: 0.1
+
+    # Target degree ratio for graph density
+    target_degree_ratio: 2.0
+
+    # Dynamism threshold for triggering maintenance
+    dynamism_threshold: 0.3
+
+    # Maximum interval between exploration rounds (seconds)
+    max_exploration_interval_secs: 60
+
+    # Exploration configuration
+    exploration_config:
+      # K value for convergence phase
+      converge_k: 50
+
+      # Configuration for convergence queries
+      converge_config:
+        search_list_size: 50
+        concurrency_limit: 5
+        share_floor: 3
+        timeout: 500
+
+      # K value for exploration phase (0 = disabled)
+      explore_k: 0
+
+      # Configuration for exploration queries
+      explore_config:
+        search_list_size: 0
+        concurrency_limit: 3
+        share_floor: 2
+        timeout: 500
+
+# Output directory for results (mounted volume)
+output_dir: "/app/output"
+
+# Coordinator gRPC server bind address (listen on all interfaces in container)
+coordinator_bind_address: "0.0.0.0:50050"

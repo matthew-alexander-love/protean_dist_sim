@@ -20,6 +20,9 @@ service WorkerNode {
     /// Create multiple peers at once (for bootstrapping)
     rpc CreatePeers(CreatePeersRequest) returns (Ack) {}
 
+    /// Bootstrap an existing peer
+    rpc BootstrapPeer(BootstrapPeerRequest) returns (Ack) {}
+
     /// Delete specific peers by UUID
     rpc DeletePeers(DeletePeersRequest) returns (Ack) {}
 
@@ -101,10 +104,25 @@ message LoadEmbeddingsRequest {
 
 /* --------------------- Peer Lifecycle Messages --------------------- */
 
+/// Bootstrap peer information for peer creation
+message BootstrapPeerInfo {
+    bytes uuid = 1;                      // UUID of bootstrap peer
+    onnx.TensorProto embedding = 2;      // DEPRECATED: Embedding of bootstrap peer (use global_index instead)
+    string worker_address = 3;           // Address of worker hosting bootstrap peer
+    uint64 global_index = 4;             // Global index of bootstrap peer (worker looks up embedding locally)
+}
+
 /// Request to create multiple peers
 message CreatePeersRequest {
     repeated uint64 global_indices = 1;  // Global dataset indices for peers to create
-    uint64 bootstrap_index = 2;          // Global index of bootstrap peer (0 = no bootstrap)
+    uint64 bootstrap_index = 2;          // DEPRECATED: Global index of bootstrap peer (use bootstrap_peer instead)
+    BootstrapPeerInfo bootstrap_peer = 3; // Bootstrap peer information (optional)
+}
+
+/// Request to bootstrap an existing peer
+message BootstrapPeerRequest {
+    uint64 peer_index = 1;                // Global index of peer to bootstrap
+    BootstrapPeerInfo bootstrap_peer = 2;  // Bootstrap target peer information
 }
 
 /// Request to delete specific peers
@@ -191,6 +209,7 @@ message WorkerIdResponse {
     string worker_id = 1;  // Unique worker identifier assigned by coordinator
     bool success = 2;
     string message = 3;
+    string coordinator_address = 4;  // Address of coordinator for event forwarding
 }
 
 /// Request with worker ID
