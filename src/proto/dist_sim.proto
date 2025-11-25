@@ -20,9 +20,6 @@ service WorkerNode {
     /// Create multiple peers at once (for bootstrapping)
     rpc CreatePeers(CreatePeersRequest) returns (Ack) {}
 
-    /// Bootstrap an existing peer
-    rpc BootstrapPeer(BootstrapPeerRequest) returns (Ack) {}
-
     /// Delete specific peers by UUID
     rpc DeletePeers(DeletePeersRequest) returns (Ack) {}
 
@@ -278,7 +275,6 @@ message BootstrapCompletedEvent {
 /// Unified event message
 message ProteanEventProto {
     ProteanEventType event_type = 1;
-    string worker_id = 2;
     uint64 timestamp_ms = 3;  // Event timestamp (ms since epoch)
 
     oneof event {

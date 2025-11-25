@@ -11,6 +11,7 @@ use protean::{
     Protean,
     ProteanConfig,
     ProteanMessage,
+    ProteanError,
     OutMessage,
     ProteanPeer,
     QueryConfig,
@@ -21,9 +22,28 @@ use protean::{
     protean::ProteanEvent,
     address::Address,
     uuid::Uuid,
+    proto::QueryCandidateProto,
 };
 
-use crate::proto::protean::SparseNeighborViewProto;
+
+
+use tonic::{transport::Channel, Request, Response, Status};
+
+use protean::proto::{ProteanMessageProto, SparseNeighborViewProto};
+
+use crate::proto::dist_sim::{
+    coordinator_client::CoordinatorClient,
+    worker_node_client::WorkerNodeClient,
+    RouteMessageRequest, Ack,
+    protean_event_proto, ProteanEventType, StateChangedEvent, QueryCompletedEvent,
+    BootstrapConvergingCompletedEvent, BootstrapCompletedEvent,
+    ProteanEventProto, PingRequest,
+};
+
+pub struct ActorSnapshot {
+    stats: SnvSnapshot,
+    proto: SparseNeighborViewProto,
+}
 
 /// State for embedding drift functionality
 pub(crate) struct DriftState<S: EmbeddingSpace> {
@@ -72,20 +92,11 @@ where
     },
     /// Get the SNV snapshot (stats only)
     GetSnvSnapshot {
-        response: oneshot::Sender<SnvSnapshot>,
-    },
-    /// Get the full SNV as proto (for snapshot/restore)
-    GetSnvProto {
-        response: oneshot::Sender<SparseNeighborViewProto>,
+        response: oneshot::Sender<ActorSnapshot>,
     },
     /// Get the local embedding
     GetEmbedding {
         response: oneshot::Sender<S::EmbeddingData>,
-    },
-    /// Load a complete SNV snapshot
-    LoadSnvSnapshot {
-        snapshot: SparseNeighborViewProto,
-        response: oneshot::Sender<bool>,
     },
     /// Start embedding drift towards a target
     StartDrift {
@@ -100,25 +111,31 @@ pub(crate) struct ActorProtean<S: EmbeddingSpace> {
     /// The Protean peer instance (owned by this actor)
     protean: Protean<S>,
 
-    /// Incoming protocol message channel
+    /// Incoming protocol message channel from other peers
     msg_rx: UnboundedReceiver<ProteanMessage<S>>,
-    /// Incoming control messages
+
+    /// Incoming control messages from controler thread
     control_rx: UnboundedReceiver<ControlMessage<S>>,
 
     /// Shared map of all LOCAL peer channels for message routing
     peer_channels: Arc<DashMap<Uuid, UnboundedSender<ProteanMessage<S>>>>,
-    /// Messages for peers ota
-    remote_msg_tx: UnboundedSender<OutMessage<S>>,
-    /// Event Capture channel
-    event_tx: UnboundedSender<ProteanEvent<S>>,
+
+    /// gRPC connection to the coordinator
+    /// Forward Events here
+    coordinator: CoordinatorClient<Channel>,
+
+    /// gRPC connections to other worker to send messages intra worker
+    workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
 
     /// Minimum step interval (when active)
     min_step_interval: Duration,
+
     /// Maximum step interval (when idle)
     max_step_interval: Option<Duration>,
 
     /// Original embedding index (for drift functionality)
     original_embedding_index: u64,
+
     /// Current drift state (None if not drifting)
     drift_state: Option<DriftState<S>>,
 }
@@ -133,8 +150,8 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
         msg_rx: UnboundedReceiver<ProteanMessage<S>>,
         control_rx: UnboundedReceiver<ControlMessage<S>>,
         peer_channels: Arc<DashMap<Uuid, UnboundedSender<ProteanMessage<S>>>>,
-        remote_msg_tx: UnboundedSender<OutMessage<S>>,
-        event_tx: UnboundedSender<ProteanEvent<S>>,
+        coordinator: CoordinatorClient<Channel>,
+        workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
         min_step_interval: Duration,
         max_step_interval: Option<Duration>,
     ) -> Self {
@@ -151,14 +168,44 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
             msg_rx,
             control_rx,
             peer_channels,
-            remote_msg_tx,
-            event_tx,
+            coordinator,
+            workers,
             min_step_interval,
             max_step_interval,
             original_embedding_index,
             drift_state: None,
         }
     }
+
+    pub(crate) fn from_saved_nv(
+        local_address: Arc<RwLock<Address>>,
+        snv_file_path: PathBuf,
+        original_embedding_index: u64,
+        config: ProteanConfig,
+        msg_rx: UnboundedReceiver<ProteanMessage<S>>,
+        control_rx: UnboundedReceiver<ControlMessage<S>>,
+        peer_channels: Arc<DashMap<Uuid, UnboundedSender<ProteanMessage<S>>>>,
+        coordinator: CoordinatorClient<Channel>,
+        workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
+        min_step_interval: Duration,
+        max_step_interval: Option<Duration>,
+    ) -> Result<Self, ProteanError> {
+        let protean = Protean::from_saved_snv(local_address.read().unwrap().clone(), snv_file_path, config)?;
+
+        Ok(Self {
+            protean,
+            msg_rx,
+            control_rx,
+            peer_channels,
+            coordinator,
+            workers,
+            min_step_interval,
+            max_step_interval,
+            original_embedding_index,
+            drift_state: None,
+        })
+    }
+
 
     /// Main actor event loop
     ///
@@ -178,7 +225,7 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                 },
 
                 Some(msg) = self.msg_rx.recv() => {
-                    self.process_message(msg);
+                    self.process_message(msg).await;
 
                     // Reset Timer on Work done at this node
                     current_interval = self.min_step_interval;
@@ -187,7 +234,7 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                 },
 
                 _ = step_interval.tick() => {
-                    let was_productive = self.auto_step();
+                    let was_productive = self.auto_step().await;
                     if was_productive {
                         // Reset Timer on Work done at this node
                         current_interval = self.min_step_interval;
@@ -210,41 +257,77 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
 
     }
 
-    fn process_message(&mut self, msg: ProteanMessage<S>) {
+
+    fn event_to_proto(event: &ProteanEvent<S>, peer_uuid: &Uuid) -> ProteanEventProto {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        match event {
+            ProteanEvent::StateChanged { from_state, to_state } => {
+                ProteanEventProto {
+                    event_type: ProteanEventType::StateChanged as i32,
+                    timestamp_ms,
+                    event: Some(protean_event_proto::Event::StateChanged(StateChangedEvent {
+                        peer_uuid: peer_uuid.as_bytes().to_vec(),
+                        from_state: format!("{:?}", from_state),
+                        to_state: format!("{:?}", to_state),
+                    })),
+                }
+            },
+            ProteanEvent::QueryCompleted { local_uuid, result } => {
+                ProteanEventProto {
+                    event_type: ProteanEventType::QueryCompleted as i32,
+                    timestamp_ms,
+                    event: Some(protean_event_proto::Event::QueryCompleted(QueryCompletedEvent {
+                        peer_uuid: local_uuid.as_bytes().to_vec(),
+                        query_uuid: result.query_uuid.as_bytes().to_vec(),
+                        candidates: result.candidates.iter().map(|c| QueryCandidateProto::from(c.clone())).collect(),
+                        hops: 0, // TODO: Track hops in QueryResult
+                        latency_ms: 0, // TODO: Track latency in QueryResult
+                    })),
+                }
+            },
+            ProteanEvent::BootstrapConvergingCompleted { local_uuid } => {
+                ProteanEventProto {
+                    event_type: ProteanEventType::BootstrapConvergingCompleted as i32,
+                    timestamp_ms,
+                    event: Some(protean_event_proto::Event::BootstrapConvergingCompleted(
+                        BootstrapConvergingCompletedEvent {
+                            peer_uuid: local_uuid.as_bytes().to_vec(),
+                        }
+                    )),
+                }
+            },
+            ProteanEvent::BootstrapCompleted { local_uuid } => {
+                ProteanEventProto {
+                    event_type: ProteanEventType::BootstrapCompleted as i32,
+                    timestamp_ms,
+                    event: Some(protean_event_proto::Event::BootstrapCompleted(
+                        BootstrapCompletedEvent {
+                            peer_uuid: local_uuid.as_bytes().to_vec(),
+                        }
+                    )),
+                }
+            },
+        }
+    }
+
+    async fn process_message(&mut self, msg: ProteanMessage<S>) {
         tracing::info!("[Actor {}] Received protocol message: {:?}", self.protean.uuid(), msg);
-        // Check drift before processing message
         self.update_drift_if_needed();
 
         let step = self.protean.event(msg);
         tracing::info!("[Actor {}] After processing message: {} messages, {} events",
             self.protean.uuid(), step.messages().len(), step.events().len());
-        self.route_messages(step.messages());
-
-        for event in step.events() {
-            println!("[Actor {}] Event from message processing: {:?}", self.protean.uuid(), event);
-            if let Err(e) = self.event_tx.send(event.clone()) {
-                tracing::error!("Failed to send event: {:?}", e);
-                println!("[Actor {}] ERROR sending event: {:?}", self.protean.uuid(), e);
-            } else {
-                println!("[Actor {}] Event sent successfully", self.protean.uuid());
-            }
-        }
-
-        // CRITICAL: Call step() after processing message to progress query state machine.
-        // This generates follow-up KNN/KFN requests, triggers occlusion pruning, and ensures
-        // queries don't stall waiting for the periodic timer (which gets reset on each message).
-        let post_step = self.protean.step();
-        if !post_step.messages().is_empty() || !post_step.events().is_empty() {
-            println!("[Actor {}] Post-message step: {} messages, {} events",
-                self.protean.uuid(), post_step.messages().len(), post_step.events().len());
-            self.route_messages(post_step.messages());
-            for event in post_step.events() {
-                let _ = self.event_tx.send(event.clone());
-            }
-        }
+        
+        self.route_messages(step.messages()).await;
+        self.forward_events(&step.events()).await;
     }
 
-    fn process_control(&mut self, msg: ControlMessage<S>) {
+    async fn process_control(&mut self, msg: ControlMessage<S>) {
         // Check drift before processing control messages that trigger steps
         match &msg {
             ControlMessage::Bootstrap { .. } | ControlMessage::Query { .. } => {
@@ -262,12 +345,8 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                     // Bootstrap started, step to get initial messages
                     let step = self.protean.step();
                     tracing::trace!("[Actor {}] Bootstrap step: {} messages, {} events", self.protean.uuid(), step.messages().len(), step.events().len());
-                    self.route_messages(step.messages());
-
-                    for event in step.events() {
-                        println!("[Actor {}] Sending event from bootstrap step: {:?}", self.protean.uuid(), event);
-                        let _ = self.event_tx.send(event.clone());
-                    }
+                    self.route_messages(step.messages()).await;
+                    self.forward_events(step.events()).await;
                 }
             },
             ControlMessage::Query { embedding, k, config, response } => {
@@ -275,11 +354,8 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                 let _ = response.send(query_uuid);
 
                 let step = self.protean.step();
-                self.route_messages(step.messages());
-
-                for event in step.events() {
-                    let _ = self.event_tx.send(event.clone());
-                }
+                self.route_messages(step.messages()).await;
+                self.forward_events(step.events()).await;
             },
             ControlMessage::Shutdown => {
                 if self.protean.is_connected() {
@@ -301,21 +377,17 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                 let _ = reply.send(status);
             },
             ControlMessage::GetSnvSnapshot { response } => {
-                let snapshot = self.protean.snv_snapshot();
-                let _ = response.send(snapshot);
-            },
-            ControlMessage::GetSnvProto { response } => {
-                let snv_proto = self.protean.to_proto();
-                let _ = response.send(snv_proto);
+                let stats = self.protean.snv_snapshot();
+                let proto = self.protean.to_proto();
+                let ss = ActorSnapshot {
+                    stats,
+                    proto
+                };
+                let _ = response.send(ss);
             },
             ControlMessage::GetEmbedding { response } => {
                 let embedding = self.protean.embedding().clone();
                 let _ = response.send(embedding);
-            },
-            ControlMessage::LoadSnvSnapshot { snapshot: _, response } => {
-                // TODO: Implement load_snv_snapshot in Protean
-                // For now, just return false
-                let _ = response.send(false);
             },
             ControlMessage::StartDrift { original_embedding, target_embedding, update_interval, total_steps } => {
                 // Initialize drift state
@@ -337,7 +409,7 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
         }
     }
 
-    fn auto_step(&mut self) -> bool {
+    async fn auto_step(&mut self) -> bool {
         // Check if we need to update embedding due to drift
         self.update_drift_if_needed();
 
@@ -351,17 +423,8 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                 self.protean.uuid(), step.messages().len(), step.events().len());
         }
 
-        self.route_messages(step.messages());
-
-        for event in step.events() {
-            println!("[Actor {}] Auto-step generated event: {:?}", self.protean.uuid(), event);
-            if let Err(e) = self.event_tx.send(event.clone()) {
-                tracing::error!("Failed to send event: {:?}", e);
-                println!("[Actor {}] ERROR sending event: {:?}", self.protean.uuid(), e);
-            } else {
-                println!("[Actor {}] Event sent to event_tx successfully", self.protean.uuid());
-            }
-        }
+        self.route_messages(step.messages()).await;
+        self.forward_events(step.events()).await;
 
         has_messages || has_events
     }
@@ -440,7 +503,7 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
         S::EmbeddingData::from_slice(&lerped)
     }
 
-    fn route_messages(&self, msgs: &[OutMessage<S>]) {
+    async fn route_messages(&self, msgs: &[OutMessage<S>]) {
         for outgoing in msgs {
             if &outgoing.destination.address == self.protean.address() {
                 // Local routing
@@ -448,10 +511,41 @@ impl<S: EmbeddingSpace> ActorProtean<S> {
                     let _ = channel.send(outgoing.message.clone());
                 }
             } else {
-                // Remote routing (cross-worker)
                 tracing::info!("[Actor {}] Sending REMOTE message to {} at {}",
                     self.protean.uuid(), outgoing.destination.uuid, outgoing.destination.address);
-                let _ = self.remote_msg_tx.send(outgoing.clone());
+                if let Some(mut worker_entry) = self.workers.get_mut(&outgoing.destination.address) {
+                    let route_message_proto = RouteMessageRequest {
+                        destination_uuid: outgoing.destination.uuid.to_bytes(),
+                        message: Some(ProteanMessageProto::from(outgoing.message.clone())),
+                    };
+
+                    match worker_entry.route_message(Request::new(route_message_proto)).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to route message to {}: {}", outgoing.destination.address, e);
+                        }
+                    }
+                } else {
+                    tracing::error!("Worker not found for address: {}", outgoing.destination.address);
+                }
+            }
+        }
+    }
+
+    async fn forward_events(&mut self, events: &[ProteanEvent<S>]) {
+        for event in events {
+            println!("[Actor {}] Event from message processing: {:?}", self.protean.uuid(), event);
+            let event_proto = Self::event_to_proto(&event, &self.protean.uuid());
+            
+            match self.coordinator.forward_event(Request::new(event_proto)).await {
+                Ok(_) => {
+                            println!("[{}] Successfully forwarded event to coordinator", self.protean.uuid());
+                            tracing::trace!("Forwarded event to coordinator");
+                        }
+                        Err(e) => {
+                            println!("[{}] Failed to forward event to coordinator: {}", self.protean.uuid(), e);
+                            tracing::error!("Failed to forward event to coordinator: {}", e);
+                        }
             }
         }
     }

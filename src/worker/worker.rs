@@ -5,30 +5,6 @@
 //! - **Event Processor Thread**: Processes local events and forwards to coordinator via ForwardEvent RPC
 //! - **Actor Management**: Spawns and manages ActorProtean instances for each peer
 //!
-//! ## WorkerNode gRPC Service - Implementation Status
-//!
-//! ### ✅ Fully Implemented
-//! 1. **Ping** - Health check (returns "pong")
-//! 2. **RegisterWorker** - Registers connection to another worker
-//! 3. **RouteMessage** - Routes protocol messages to local peers
-//! 4. **SetConfig** - Stores simulation configuration
-//! 5. **DeletePeers** - Removes peers and cleans up all state
-//! 6. **GetSnapshot** - Collects SNV snapshots from peers
-//! 7. **Churn** - Returns "not implemented" stub
-//!
-//! ### 🔧 Partially Implemented (needs proto parsing)
-//! 8. **CreatePeers** - Needs embedding tensor parsing
-//! 9. **ExecuteQuery** - Needs embedding/config parsing
-//! 10. **TrueQuery** - Needs embedding parsing and ControlMessage::GetEmbedding
-//! 11. **LoadSnapshot** - Needs snapshot proto parsing and ControlMessage::LoadSnvSnapshot
-//!
-//! ## TODOs
-//! - Implement embedding tensor proto conversion (TensorProto <-> S::EmbeddingData)
-//! - Implement config proto conversion (SimConfigProto -> ProteanConfig)
-//! - Add ControlMessage::GetEmbedding variant for TrueQuery
-//! - Add ControlMessage::LoadSnvSnapshot variant for snapshot restoration
-//! - Implement event_to_proto() conversion for event forwarding
-//! - Handle actor_handles tracking with interior mutability
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -74,16 +50,21 @@ use protean::{
 };
 
 /// Commands sent to the churn background thread
-enum ChurnCommand {
+enum PeerControlerCommand {
     Start(ChurnPatternRequest),
     Stop,
+}
+
+pub struct EmbeddingPool<S: EmbeddingSpace> {
+    embeddings: Vec<S::EmbeddingData>,
+    offset: usize,
 }
 
 pub struct Worker<S: EmbeddingSpace> {
     worker_id: String,
     my_address: Arc<RwLock<Address>>,
 
-    /// gRPC connections to other workers (we keep connections to all other workers in sim (scale is only up to 1k))
+    /// gRPC connections to other worker
     workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
 
     /// gRPC connection to the coordinator
@@ -105,31 +86,31 @@ pub struct Worker<S: EmbeddingSpace> {
     /// Tokio runtime for async tasks
     runtime: Arc<Runtime>,
 
-    /// Handles for all running threads
+    /// Actors on worker
     actor_handles: Vec<JoinHandle<()>>,
+    /// Msg Broker to other handlers
     broker_handle: Option<JoinHandle<()>>,
+    /// Event Q to Coordinator fwding thread
     event_processor_handle: Option<JoinHandle<()>>,
-    churn_handle: Option<JoinHandle<()>>,
+    /// Handles mutating actors
+    ///     Creation and Bootstrap
+    ///     Drift
+    ///     Initiate Queries
+    ///     Deletion
+    ///     Getting Snapshots
+    ///     Pausing / Unpauseing
+    peer_controller_handle: Option<JoinHandle<()>>,
 
     /// Channel to send churn commands to background thread
-    churn_tx: UnboundedSender<ChurnCommand>,
-
-    /// Atomic flag to track if churn is currently running
-    churn_running: Arc<std::sync::atomic::AtomicBool>,
+    peer_controller_tx: UnboundedSender<ChurnCommand>,
 
     /// Config for making new peers
     actor_config: Arc<RwLock<ProteanConfig>>,
 
-    /// The max number of actors this worker is allowed to host
-    max_actors: usize,
-
     /// Embedding pool for this worker (indexed by local index)
-    pub(crate) embedding_pool: Arc<RwLock<Vec<S::EmbeddingData>>>,
+    embedding_pool: Arc<RwLock<EmbeddingPool<S>>>,
 
-    /// Global offset for this worker's embeddings (worker index for round-robin distribution)
-    pub(crate) global_offset: Arc<RwLock<u64>>,
-
-    /// Total number of workers (for round-robin indexing)
+    /// Total number of workers
     n_workers: usize,
 
     // Phase tracking for event matching, query tracking, churn tracking
@@ -145,9 +126,6 @@ pub struct Worker<S: EmbeddingSpace> {
 
     /// Shutdown Nodes:
     shutdown_actors: DashMap<Uuid, ()>,
-
-    /// Pending queries waiting for results (query_uuid -> result channel)
-    pending_queries: Arc<DashMap<Uuid, oneshot::Sender<QueryResult<S>>>>,
 }
 
 // Snapshot request, create directory with timestamped at the time,
@@ -155,7 +133,7 @@ pub struct Worker<S: EmbeddingSpace> {
 // own snv protos
 
 impl<S: EmbeddingSpace> Worker<S> {
-    pub fn new(worker_id: String, my_address: Address, n_workers: usize, max_actors: usize) -> Self {
+    pub fn new(worker_id: String, my_address: Address, n_workers: usize) -> Self {
         let runtime = Builder::new_multi_thread()
             .worker_threads(n_workers)
             .thread_name(format!("worker-{}", worker_id))
@@ -199,7 +177,7 @@ impl<S: EmbeddingSpace> Worker<S> {
         let churn_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let (churn_tx, churn_rx) = unbounded_channel();
-        let churn_handle = Self::spawn_churn_thread(
+        let peer_controller_handle = Self::spawn_peer_controller_thread(
             worker_id.clone(),
             Arc::clone(&actor_control_channels),
             Arc::clone(&actor_protocol_channels),
@@ -229,11 +207,10 @@ impl<S: EmbeddingSpace> Worker<S> {
             actor_handles: Vec::new(),
             broker_handle: Some(broker_handle),
             event_processor_handle: Some(event_processor_handle),
-            churn_handle: Some(churn_handle),
+            peer_controller_handle: Some(peer_controller_handle),
             churn_tx,
             churn_running,
             actor_config,
-            max_actors,
             embedding_pool,
             global_offset,
             n_workers,
@@ -284,9 +261,6 @@ impl<S: EmbeddingSpace> Worker<S> {
                         Uuid::from_bytes([0u8; 64])
                     }
                 };
-
-                // TODO: Process event locally (update tracking maps for bootstrap/active/shutdown)
-                // Could update bootstrapping_actors, active_actors, etc. based on event type
 
                 // Handle QueryCompleted events - send results to pending queries
                 if let ProteanEvent::QueryCompleted { result, .. } = &event {
@@ -724,66 +698,7 @@ impl<S: EmbeddingSpace> Worker<S> {
         })
     }
 
-    fn event_to_proto(event: &ProteanEvent<S>, worker_id: &str, peer_uuid: &Uuid) -> ProteanEventProto {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        match event {
-            ProteanEvent::StateChanged { from_state, to_state } => {
-                ProteanEventProto {
-                    event_type: ProteanEventType::StateChanged as i32,
-                    worker_id: worker_id.to_string(),
-                    timestamp_ms,
-                    event: Some(protean_event_proto::Event::StateChanged(StateChangedEvent {
-                        peer_uuid: peer_uuid.as_bytes().to_vec(),
-                        from_state: format!("{:?}", from_state),
-                        to_state: format!("{:?}", to_state),
-                    })),
-                }
-            },
-            ProteanEvent::QueryCompleted { local_uuid, result } => {
-                ProteanEventProto {
-                    event_type: ProteanEventType::QueryCompleted as i32,
-                    worker_id: worker_id.to_string(),
-                    timestamp_ms,
-                    event: Some(protean_event_proto::Event::QueryCompleted(QueryCompletedEvent {
-                        peer_uuid: local_uuid.as_bytes().to_vec(),
-                        query_uuid: result.query_uuid.as_bytes().to_vec(),
-                        candidates: result.candidates.iter().map(|c| QueryCandidateProto::from(c.clone())).collect(),
-                        hops: 0, // TODO: Track hops in QueryResult
-                        latency_ms: 0, // TODO: Track latency in QueryResult
-                    })),
-                }
-            },
-            ProteanEvent::BootstrapConvergingCompleted { local_uuid } => {
-                ProteanEventProto {
-                    event_type: ProteanEventType::BootstrapConvergingCompleted as i32,
-                    worker_id: worker_id.to_string(),
-                    timestamp_ms,
-                    event: Some(protean_event_proto::Event::BootstrapConvergingCompleted(
-                        BootstrapConvergingCompletedEvent {
-                            peer_uuid: local_uuid.as_bytes().to_vec(),
-                        }
-                    )),
-                }
-            },
-            ProteanEvent::BootstrapCompleted { local_uuid } => {
-                ProteanEventProto {
-                    event_type: ProteanEventType::BootstrapCompleted as i32,
-                    worker_id: worker_id.to_string(),
-                    timestamp_ms,
-                    event: Some(protean_event_proto::Event::BootstrapCompleted(
-                        BootstrapCompletedEvent {
-                            peer_uuid: local_uuid.as_bytes().to_vec(),
-                        }
-                    )),
-                }
-            },
-        }
-    }
+    
 
     fn spawn_broker_thread(
         workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
