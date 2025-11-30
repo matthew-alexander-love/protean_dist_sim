@@ -10,48 +10,57 @@
 //! ## Usage
 //! ```bash
 //! cargo run --bin coordinator -- \
-//!     --config config.yaml \
-//!     --test-plan test_plan.yaml
+//!     --test-plan test_plan.yaml \
+//!     --data-dir ./data
 //! ```
-//!
-//! ## Embedding Space Selection
-//! The embedding space is selected at compile time via feature flags:
-//! - Default: f32l2 (L2 distance with 128 dimensions)
 
 use std::error::Error;
-use std::fs;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use protean::embedding_space::EmbeddingSpace;
+use protean::embedding_space::F32L2Space;
+use protean::SnvConfig;
 use tonic::transport::Server;
-use tracing::{info, warn, error};
+use tracing::{error, info};
 
-use protean_dist_sim::coordinator::{Coordinator, CoordinatorConfig, CoordinatorService, TestPlan};
-use protean_dist_sim::proto::dist_sim::coordinator_server::CoordinatorServer;
+use protean_dist_sim::coordinator::{
+    Coordinator, CoordinatorConfig, Sift1MDataset, TestPlan,
+};
+use protean_dist_sim::proto::dist_sim::coordinator_node_server::CoordinatorNodeServer;
 
 /// Command-line arguments for coordinator binary
 #[derive(Parser, Debug)]
 #[command(name = "coordinator")]
 #[command(about = "Distributed ANN test coordinator", long_about = None)]
 struct Args {
-    /// Path to coordinator configuration YAML file
-    #[arg(long)]
-    config: String,
-
     /// Path to test plan YAML file
     #[arg(long)]
     test_plan: String,
 
-    /// Timeout for waiting for workers to register (seconds)
-    #[arg(long, default_value = "30")]
-    worker_timeout: u64,
+    /// Path to data directory (for SIFT1M dataset)
+    #[arg(long, default_value = "./data")]
+    data_dir: String,
+
+    /// Number of workers to wait for
+    #[arg(long, default_value = "1")]
+    num_workers: usize,
+
+    /// Maximum peers per worker
+    #[arg(long, default_value = "100000")]
+    workers_capacity: usize,
+
+    /// gRPC bind address
+    #[arg(long, default_value = "0.0.0.0:50050")]
+    bind_address: String,
+
+    /// Output directory for results
+    #[arg(long, default_value = "./output")]
+    output_dir: String,
 }
 
-// Compile-time embedding space selection via feature flags
-type EmbeddingSpaceImpl = protean::embedding_space::spaces::f32_l2::F32L2Space<128>;
+// Sift1MDataset uses F32L2Space<128>
+type Sift1MEmbeddingSpace = F32L2Space<128>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -66,63 +75,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     info!("Starting coordinator");
-    info!("  Config file: {}", args.config);
     info!("  Test plan file: {}", args.test_plan);
-    info!("  Embedding space: F32L2Space<128>");
+    info!("  Data directory: {}", args.data_dir);
+    info!("  Num workers: {}", args.num_workers);
+    info!("  Bind address: {}", args.bind_address);
+    info!("  Dataset: SIFT1M (F32L2Space<128>)");
 
-    // Run the coordinator
-    run_coordinator::<EmbeddingSpaceImpl>(args).await
+    run_coordinator(args).await
 }
 
-/// Main coordinator logic
-async fn run_coordinator<S>(args: Args) -> Result<(), Box<dyn Error>>
-where
-    S: EmbeddingSpace,
-    S::EmbeddingData: protean::embedding_space::Embedding<Scalar = f32>,
-{
-    // Load configuration
-    info!("Loading configuration from {}...", args.config);
-    let config_str = fs::read_to_string(&args.config)
-        .map_err(|e| format!("Failed to read config file '{}': {}", args.config, e))?;
-
-    let config: CoordinatorConfig = serde_yaml::from_str(&config_str)
-        .map_err(|e| format!("Failed to parse config YAML: {}", e))?;
-
-    info!("Loaded configuration:");
-    info!("  Workers: {}", config.workers.len());
-    info!("  Base dataset: {}", config.dataset.base_path);
-    info!("  Query dataset: {}", config.dataset.query_path);
-    info!("  Output dir: {}", config.output_dir);
-
+/// Main coordinator logic using SIFT1M dataset
+async fn run_coordinator(args: Args) -> Result<(), Box<dyn Error>> {
     // Load test plan
     info!("Loading test plan from {}...", args.test_plan);
-    let test_plan_str = fs::read_to_string(&args.test_plan)
-        .map_err(|e| format!("Failed to read test plan file '{}': {}", args.test_plan, e))?;
-
-    let test_plan: TestPlan = serde_yaml::from_str(&test_plan_str)
-        .map_err(|e| format!("Failed to parse test plan YAML: {}", e))?;
+    let test_plan = TestPlan::from_yaml(&args.test_plan)
+        .map_err(|e| format!("Failed to load test plan: {}", e))?;
 
     info!("Loaded test plan with {} phases", test_plan.phases.len());
 
-    // Create coordinator
-    info!("Creating coordinator...");
-    let coordinator = Coordinator::<S>::new(config.clone())
-        .await
+    // Create configuration
+    let config = CoordinatorConfig {
+        workers_capacity: args.workers_capacity,
+        num_workers: args.num_workers,
+        snv_config: SnvConfig::default(),
+        output_dir: args.output_dir.clone(),
+        coordinator_bind_address: args.bind_address.clone(),
+    };
+
+    let dataloader = Sift1MDataset::new(&args.data_dir);
+
+    // Create coordinator - embedding space is determined by the dataloader
+    info!("Creating coordinator and loading dataset...");
+    let coordinator = Coordinator::<Sift1MEmbeddingSpace>::new(dataloader, test_plan, config.clone())
         .map_err(|e| format!("Failed to create coordinator: {}", e))?;
 
-    let coordinator_arc = Arc::new(coordinator);
-
     // Parse bind address for gRPC server
-    let bind_addr: SocketAddr = config
-        .coordinator_bind_address
+    let bind_addr: SocketAddr = args
+        .bind_address
         .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", config.coordinator_bind_address, e))?;
+        .map_err(|e| format!("Invalid bind address '{}': {}", args.bind_address, e))?;
 
     info!("Starting coordinator gRPC server on {}...", bind_addr);
 
-    // Create gRPC service
-    let service = CoordinatorService::new(coordinator_arc.clone());
-    let grpc_server = CoordinatorServer::new(service)
+    // Wrap coordinator in Arc for sharing with gRPC server
+    let coordinator = std::sync::Arc::new(coordinator);
+    let coordinator_for_run = coordinator.clone();
+
+    let grpc_server = CoordinatorNodeServer::new(coordinator)
         .max_decoding_message_size(100 * 1024 * 1024) // 100MB
         .max_encoding_message_size(100 * 1024 * 1024); // 100MB
 
@@ -138,63 +137,30 @@ where
     tokio::time::sleep(Duration::from_millis(500)).await;
     info!("Coordinator gRPC server started");
 
-    // Wait for workers to register
-    info!(
-        "Waiting for {} workers to register (timeout: {}s)...",
-        config.workers.len(),
-        args.worker_timeout
-    );
-
-    let worker_timeout = Duration::from_secs(args.worker_timeout);
-    match coordinator_arc.wait_for_workers(worker_timeout).await {
-        Ok(_) => info!("All workers registered successfully"),
-        Err(e) => {
-            warn!("Worker registration issue: {}. Proceeding with registered workers...", e);
-        }
-    }
-
-    info!("Current worker count: {}", coordinator_arc.workers().len());
-
-    // Load datasets
-    info!("Loading datasets...");
-    coordinator_arc
-        .load_datasets()
-        .await
-        .map_err(|e| format!("Failed to load datasets: {}", e))?;
-
-    info!("Datasets loaded successfully");
-
-    // Distribute embeddings to workers
-    info!("Distributing embeddings to workers...");
-    coordinator_arc
-        .distribute_embeddings()
-        .await
-        .map_err(|e| format!("Failed to distribute embeddings: {}", e))?;
-
-    info!("Embeddings distributed successfully");
-
-    // Execute test plan
-    info!("Executing test plan...");
-    match coordinator_arc.run_test_plan(test_plan).await {
-        Ok(_) => info!("Test plan completed successfully"),
-        Err(e) => {
+    // Execute test plan in background
+    let run_handle = tokio::spawn(async move {
+        if let Err(e) = coordinator_for_run.run().await {
             error!("Test plan execution failed: {}", e);
-            return Err(e);
+        }
+    });
+
+    // Wait for either the test plan to complete or the server to error
+    tokio::select! {
+        result = run_handle => {
+            match result {
+                Ok(()) => info!("Test plan completed"),
+                Err(e) => error!("Test plan task error: {}", e),
+            }
+        }
+        result = server_handle => {
+            match result {
+                Ok(Ok(())) => info!("Server shutdown gracefully"),
+                Ok(Err(e)) => error!("Server error: {}", e),
+                Err(e) => error!("Server task error: {}", e),
+            }
         }
     }
 
-    // Write results
-    info!("Writing results to {}...", config.output_dir);
-    coordinator_arc
-        .write_results()
-        .await
-        .map_err(|e| format!("Failed to write results: {}", e))?;
-
-    info!("Results written successfully");
     info!("Coordinator shutting down");
-
-    // Shutdown gRPC server
-    server_handle.abort();
-
     Ok(())
 }

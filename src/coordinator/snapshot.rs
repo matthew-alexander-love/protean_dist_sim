@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::proto::dist_sim::NetworkSnapshot;
-use crate::proto::protean::{PeerStatusProto, SparseNeighborViewProto};
+use crate::proto::protean::SparseNeighborViewProto;
 
 /// Parsed snapshot with adjacency matrices and statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]

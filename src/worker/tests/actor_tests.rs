@@ -1,11 +1,15 @@
 //! Tests for ActorProtean
+//!
+//! Tests the ControlMessage variants used for actor communication.
 
 use super::helpers::*;
-use crate::worker::actor::{ControlMessage, ActorProtean};
+use crate::worker::actor::ControlMessage;
 use protean::embedding_space::spaces::f32_l2::F32L2Space;
 use protean::ProteanPeer;
 use protean::uuid::Uuid;
 use tokio::sync::oneshot;
+use std::path::PathBuf;
+use std::time::Duration;
 
 type TestSpace = F32L2Space<4>;
 
@@ -13,9 +17,8 @@ type TestSpace = F32L2Space<4>;
 mod control_message_tests {
     use super::*;
 
-    // NOTE: These are integration-style tests that would require
-    // a fully running ActorProtean instance. For now, these are
-    // structural tests to verify the ControlMessage API.
+    // NOTE: These are structural tests that verify the ControlMessage API.
+    // Full integration tests would require a running ActorProtean instance.
 
     #[test]
     fn test_control_message_bootstrap() {
@@ -101,24 +104,64 @@ mod control_message_tests {
     }
 
     #[test]
-    fn test_control_message_load_snv_snapshot() {
+    fn test_control_message_save() {
         let (tx, _rx) = oneshot::channel();
 
-        let msg = ControlMessage::<TestSpace>::LoadSnvSnapshot {
-            snapshot: Default::default(),
+        let msg = ControlMessage::<TestSpace>::Save {
+            save_path: PathBuf::from("/tmp/test_snapshot"),
             response: tx,
         };
 
         match msg {
-            ControlMessage::LoadSnvSnapshot { .. } => {}
+            ControlMessage::Save { save_path, .. } => {
+                assert_eq!(save_path, PathBuf::from("/tmp/test_snapshot"));
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_control_message_get_query_status() {
+        let (tx, _rx) = oneshot::channel();
+        let query_uuid = Uuid::from_data("test-query");
+
+        let msg = ControlMessage::<TestSpace>::GetQueryStatus {
+            query_uuid: query_uuid.clone(),
+            reply: tx,
+        };
+
+        match msg {
+            ControlMessage::GetQueryStatus { query_uuid: uuid, .. } => {
+                assert_eq!(uuid, query_uuid);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_control_message_start_drift() {
+        let original = create_test_embedding_proto(vec![1.0, 0.0, 0.0, 0.0]).try_into().unwrap();
+        let target = create_test_embedding_proto(vec![0.0, 1.0, 0.0, 0.0]).try_into().unwrap();
+
+        let msg = ControlMessage::<TestSpace>::StartDrift {
+            original_embedding: original,
+            target_embedding: target,
+            update_interval: Duration::from_millis(100),
+            total_steps: 10,
+        };
+
+        match msg {
+            ControlMessage::StartDrift { total_steps, .. } => {
+                assert_eq!(total_steps, 10);
+            }
             _ => panic!("Wrong variant"),
         }
     }
 }
 
 // Note: Full ActorProtean integration tests would require:
-// - Spawning actual actors
+// - Spawning actual actors with coordinator connection
 // - Sending control messages and verifying responses
 // - Checking event emissions
-// - Testing message routing
-// These would be better suited for integration tests with full runtime
+// - Testing message routing between workers
+// These are covered by the coordinator integration tests

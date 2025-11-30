@@ -25,7 +25,7 @@ use tonic::transport::Server;
 use tracing::{info, error};
 
 use protean_dist_sim::proto::dist_sim::worker_node_server::WorkerNodeServer;
-use protean_dist_sim::proto::dist_sim::coordinator_client::CoordinatorClient;
+use protean_dist_sim::proto::dist_sim::coordinator_node_client::CoordinatorNodeClient;
 use protean_dist_sim::proto::dist_sim::WorkerInfo;
 use protean_dist_sim::worker::worker::Worker;
 
@@ -51,13 +51,6 @@ struct Args {
     #[arg(long)]
     coordinator_address: String,
 
-    /// Number of workers in the cluster (default: 2)
-    #[arg(long, default_value = "2")]
-    n_workers: usize,
-
-    /// Maximum number of actor threads (default: 1000)
-    #[arg(long, default_value = "1000")]
-    max_actors: usize,
 }
 
 // Compile-time embedding space selection via feature flags
@@ -86,7 +79,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Main worker logic
-async fn run_worker<S: EmbeddingSpace>(args: Args) -> Result<(), Box<dyn Error>> {
+async fn run_worker<S: EmbeddingSpace + Send + Sync + 'static>(args: Args) -> Result<(), Box<dyn Error>>
+where
+    S::EmbeddingData: Send + Sync + protean::embedding_space::Embedding<Scalar = f32>,
+{
     // Parse bind address
     let bind_addr: SocketAddr = args
         .bind_address
@@ -101,21 +97,12 @@ async fn run_worker<S: EmbeddingSpace>(args: Args) -> Result<(), Box<dyn Error>>
 
     info!("Creating worker instance...");
 
-    // Create worker instance
+    // Create worker instance with coordinator address for lazy connection
     let worker = Worker::<S>::new(
         args.worker_id.clone(),
         my_address,
-        args.n_workers,
-        args.max_actors,
+        Some(args.coordinator_address.clone()),
     );
-
-    // Connect worker to coordinator (so it can send events back)
-    info!("Connecting to coordinator at {}...", args.coordinator_address);
-    worker
-        .set_coordinator(args.coordinator_address.clone())
-        .await
-        .map_err(|e| format!("Failed to connect to coordinator: {}", e))?;
-    info!("Successfully connected to coordinator");
 
     // Create gRPC service (Worker implements WorkerNode trait)
     let service = WorkerNodeServer::new(worker)
@@ -136,7 +123,8 @@ async fn run_worker<S: EmbeddingSpace>(args: Args) -> Result<(), Box<dyn Error>>
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     info!("Worker gRPC server started");
 
-    // Register with coordinator (NOW that our server is running)
+    // Register with coordinator (coordinator connects to us)
+    // This must happen AFTER our gRPC server is running because coordinator will connect back to us
     info!("Registering with coordinator at {}...", args.coordinator_address);
     let advertise_addr = args.advertise_address.as_deref().unwrap_or(&args.bind_address);
     match register_with_coordinator(
@@ -168,22 +156,19 @@ async fn register_with_coordinator(
 ) -> Result<String, Box<dyn Error>> {
     // Connect to coordinator
     let coordinator_url = format!("http://{}", coordinator_address);
-    let mut client = CoordinatorClient::connect(coordinator_url).await?;
+    let mut client = CoordinatorNodeClient::connect(coordinator_url).await?;
 
     // Send registration request
     let request = tonic::Request::new(WorkerInfo {
         address: bind_address.to_string(),
-        capacity: 10000, // Default capacity
-        region: String::new(),
-        version: String::new(),
     });
 
     let response = client.register_worker(request).await?;
-    let worker_id_response = response.into_inner();
+    let ack = response.into_inner();
 
-    if !worker_id_response.success {
-        return Err(format!("Registration failed: {}", worker_id_response.message).into());
+    if !ack.success {
+        return Err(format!("Registration failed: {}", ack.message).into());
     }
 
-    Ok(worker_id_response.worker_id)
+    Ok(ack.message)
 }
