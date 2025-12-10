@@ -1,10 +1,11 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tokio::time::{interval, MissedTickBehavior};
 
 use protean::{
@@ -36,7 +37,7 @@ use crate::proto::dist_sim::{
     worker_node_client::WorkerNodeClient,
     RouteMessageRequest,
     protean_event_proto, ProteanEventType, StateChangedEvent, QueryCompletedEvent,
-    BootstrapConvergingCompletedEvent, BootstrapCompletedEvent,
+    BootstrapCompletedEvent,
     ProteanEventProto,
 };
 

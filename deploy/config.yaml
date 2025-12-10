@@ -1,0 +1,174 @@
+# Simulation configuration
+sim_config:
+  # Maximum number of peers per worker
+  max_peers_per_worker: 5000
+  
+  num_workers: 2
+
+  data_dir: "deploy/data/"
+
+  output_dir: "out/"
+
+  protean_config:
+    # Timeout for all things inside a protean
+    timeout: 500
+
+    # Max queries at one time
+    max_concurrent_queries: 3
+
+    # SNV (Sparse Neighbor View) configuration
+    snv_config:
+      # Maximum concurrent operations
+      concurrency_limit: 5
+
+      # Occlusion threshold for neighbor selection (0.0 - 1.0)
+      occlusion_threshold: 0.5
+
+      # Drift detection threshold (0.0 - 1.0)
+      drift_threshold: 0.1
+
+      # Target degree ratio for graph density
+      target_degree_ratio: 2.0
+
+      # Dynamism threshold for triggering maintenance
+      dynamism_threshold: 0.3
+
+      # Maximum interval between exploration rounds (seconds)
+      max_exploration_interval_secs: 20
+
+      # Exploration configuration
+      exploration_config:
+        # K value for convergence phase
+        converge_k: 50
+
+        # Configuration for convergence queries
+        converge_config:
+          search_list_size: 50
+          concurrency_limit: 5
+          share_floor: 3
+
+        # K value for exploration phase (0 = disabled)
+        explore_k: 0
+
+        # Configuration for exploration queries
+        explore_config:
+          search_list_size: 0
+          concurrency_limit: 3
+          share_floor: 2
+
+phases:
+  # Phase 1: Bootstrap initial network
+  - type: NetworkShaping
+    pattern: GradualJoin
+    global_indices:
+      start: 0
+      end: 8999
+    bootstrap_indices: [0]
+    rate_per_sec: 5
+
+  # Phase 2: Wait for bootstrap to stabilize
+  - type: Wait
+    duration_sec: 5
+
+  # Phase 3: Take snapshot of initial network
+  - type: Snapshot
+    output_path: "initial_network"
+
+  # Phase 4: Execute test queries from random nodes
+  - type: Query
+    num_queries: 5
+    query_indices: [0, 1, 2, 3] # These are indices from query dataset
+    k: [1, 3, 4, 10]
+    query_config: 
+      search_list_size: 0
+      concurrency_limit: 3
+      share_floor: 2
+    output_path: "initial_network"
+
+  # Phase 5: Flash crowd churn test
+  - type: NetworkShaping
+    pattern: GradualJoinLeave
+    join_global_indices:
+      start: 9000
+      end: 9999
+    leave_global_indices:
+      start: 0
+      end: 999
+    bootstrap_indices: [0]
+    join_rate_per_sec: 5
+    leave_rate_per_sec: 5
+
+  # Phase 6: Wait for churn to complete
+  - type: Wait
+    duration_sec: 10
+
+  # Phase 7: Post-churn snapshot
+  - type: Snapshot
+    output_path: "after_join_leave_shaping"
+
+  # Phase 8: Final queries
+  - type: Query
+    num_queries: 5
+    query_indices: [5, 6, 7, 8]
+    k: [1, 3, 4, 10]
+    query_config: 
+      search_list_size: 0
+      concurrency_limit: 3
+      share_floor: 2
+    output_path: "after_join_leave_shaping"
+
+  # Phase 9: Mixed churn - gradual departures
+  - type: NetworkShaping
+    pattern: GradualLeave
+    global_indices:
+      start: 1000
+      end: 1999
+    rate_per_sec: 5
+
+  # Phase 11: Wait for network to stabilize after churn
+  - type: Wait
+    duration_sec: 5
+
+  # Phase 12: Query from newly joined peers
+  - type: Query
+    num_queries: 5
+    query_indices: [10, 11, 12, 13, 14]
+    k: [1, 3, 4, 10]
+    query_config: 
+      search_list_size: 0
+      concurrency_limit: 3
+      share_floor: 2
+    output_path: "after_leave_shaping"
+
+  # Phase 13: Post-churn snapshot
+  - type: Snapshot
+    output_path: "after_leave_shaping"
+
+  # Phase 14: Embedding Drift
+  - type: NetworkShaping
+    pattern: EmbeddingDrift
+    start_indices: # What indices of peers will start drifting now
+      start: 2000
+      end: 9999
+    end_indices: # What indices will the be drifting to (the map)
+      start: 10000
+      end: 17999
+    drift_steps: 1000
+    duration_per_step_sec: 1
+
+  - type: Wait
+    duration_sec: 20
+
+  - type: Query
+    num_queries: 5
+    query_indices: [10, 11, 12, 13, 14]
+    k: [1, 3, 4, 10]
+    query_config: 
+      search_list_size: 0
+      concurrency_limit: 3
+      share_floor: 2
+    output_path: "after_embedding_drift_shaping"
+
+  - type: Snapshot
+    output_path: "after_embedding_drift_shaping"
+  

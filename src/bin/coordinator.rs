@@ -9,9 +9,7 @@
 //!
 //! ## Usage
 //! ```bash
-//! cargo run --bin coordinator -- \
-//!     --test-plan test_plan.yaml \
-//!     --data-dir ./data
+//! cargo run --bin coordinator -- --config config.yaml --num-workers 4
 //! ```
 
 use std::error::Error;
@@ -20,12 +18,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use protean::embedding_space::F32L2Space;
-use protean::SnvConfig;
 use tonic::transport::Server;
 use tracing::{error, info};
 
 use protean_dist_sim::coordinator::{
-    Coordinator, CoordinatorConfig, Sift1MDataset, TestPlan,
+    Config, Coordinator, CoordinatorConfig, Sift1MDataset,
 };
 use protean_dist_sim::proto::dist_sim::coordinator_node_server::CoordinatorNodeServer;
 
@@ -34,29 +31,25 @@ use protean_dist_sim::proto::dist_sim::coordinator_node_server::CoordinatorNodeS
 #[command(name = "coordinator")]
 #[command(about = "Distributed ANN test coordinator", long_about = None)]
 struct Args {
-    /// Path to test plan YAML file
+    /// Path to unified config YAML file (contains dataset, sim_config, and test plan)
     #[arg(long)]
-    test_plan: String,
-
-    /// Path to data directory (for SIFT1M dataset)
-    #[arg(long, default_value = "./data")]
-    data_dir: String,
+    config: String,
 
     /// Number of workers to wait for
     #[arg(long, default_value = "1")]
     num_workers: usize,
 
-    /// Maximum peers per worker
-    #[arg(long, default_value = "100000")]
-    workers_capacity: usize,
+    /// Maximum peers per worker (overrides config if provided)
+    #[arg(long)]
+    workers_capacity: Option<usize>,
 
-    /// gRPC bind address
-    #[arg(long, default_value = "0.0.0.0:50050")]
-    bind_address: String,
+    /// gRPC bind address (overrides config if provided)
+    #[arg(long)]
+    bind_address: Option<String>,
 
-    /// Output directory for results
-    #[arg(long, default_value = "./output")]
-    output_dir: String,
+    /// Output directory for results (overrides config if provided)
+    #[arg(long)]
+    output_dir: Option<String>,
 }
 
 // Sift1MDataset uses F32L2Space<128>
@@ -75,10 +68,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     info!("Starting coordinator");
-    info!("  Test plan file: {}", args.test_plan);
-    info!("  Data directory: {}", args.data_dir);
+    info!("  Config file: {}", args.config);
     info!("  Num workers: {}", args.num_workers);
-    info!("  Bind address: {}", args.bind_address);
     info!("  Dataset: SIFT1M (F32L2Space<128>)");
 
     run_coordinator(args).await
@@ -86,23 +77,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Main coordinator logic using SIFT1M dataset
 async fn run_coordinator(args: Args) -> Result<(), Box<dyn Error>> {
-    // Load test plan
-    info!("Loading test plan from {}...", args.test_plan);
-    let test_plan = TestPlan::from_yaml(&args.test_plan)
-        .map_err(|e| format!("Failed to load test plan: {}", e))?;
+    // Load unified config
+    info!("Loading config from {}...", args.config);
+    let unified_config = Config::from_yaml(&args.config)
+        .map_err(|e| format!("Failed to load config: {}", e))?;
 
-    info!("Loaded test plan with {} phases", test_plan.phases.len());
+    info!("Loaded config with {} phases", unified_config.phases.len());
+    info!("  Dataset base: {}", unified_config.dataset.base_path);
+    info!("  Dataset query: {}", unified_config.dataset.query_path);
+    info!("  Peer count: {}", unified_config.peer_count);
 
-    // Create configuration
+    // Apply CLI overrides
+    let output_dir = args.output_dir.unwrap_or(unified_config.output_dir.clone());
+    let bind_address = args.bind_address.unwrap_or(unified_config.coordinator_bind_address.clone());
+    let workers_capacity = args.workers_capacity.unwrap_or(unified_config.sim_config.max_peers);
+
+    info!("  Output dir: {}", output_dir);
+    info!("  Bind address: {}", bind_address);
+
+    // Create coordinator configuration
     let config = CoordinatorConfig {
-        workers_capacity: args.workers_capacity,
+        workers_capacity,
         num_workers: args.num_workers,
-        snv_config: SnvConfig::default(),
-        output_dir: args.output_dir.clone(),
-        coordinator_bind_address: args.bind_address.clone(),
+        snv_config: unified_config.snv_config(),
+        output_dir: output_dir.clone(),
+        coordinator_bind_address: bind_address.clone(),
     };
 
-    let dataloader = Sift1MDataset::new(&args.data_dir);
+    // Get data directory from dataset base_path (strip sift/sift_base.fvecs to get parent)
+    // e.g., /app/data/sift_base.fvecs -> /app/data, then we look for sift/ subdirectory
+    let base_path = std::path::Path::new(&unified_config.dataset.base_path);
+    let data_dir = base_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "./data".to_string());
+    info!("  Data directory: {}", data_dir);
+
+    // Extract test plan from unified config
+    let test_plan = unified_config.into_test_plan();
+
+    let dataloader = Sift1MDataset::new(&data_dir);
 
     // Create coordinator - embedding space is determined by the dataloader
     info!("Creating coordinator and loading dataset...");
@@ -110,10 +124,9 @@ async fn run_coordinator(args: Args) -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("Failed to create coordinator: {}", e))?;
 
     // Parse bind address for gRPC server
-    let bind_addr: SocketAddr = args
-        .bind_address
+    let bind_addr: SocketAddr = bind_address
         .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", args.bind_address, e))?;
+        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
 
     info!("Starting coordinator gRPC server on {}...", bind_addr);
 

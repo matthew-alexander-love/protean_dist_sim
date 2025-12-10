@@ -1,22 +1,33 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tokio::runtime::Handle;
 use tonic::{transport::Channel, Request, Response, Status};
 
 use dashmap::DashMap;
 use crate::proto::dist_sim::{
-    worker_node_server::WorkerNode, worker_node_client::WorkerNodeClient,
-    coordinator_node_client::CoordinatorNodeClient, RouteMessageRequest, Ack,
-    LoadEmbeddingsRequest, CreatePeersRequest, DeletePeersRequest,
-    DriftPeerRequest,
-    QueryRequest, QueryResponse, SnapshotRequest, NetworkSnapshot, WorkerInfo,
-    PingRequest,
+    worker_node_server::WorkerNode, 
+    worker_node_client::WorkerNodeClient,
+    coordinator_node_client::CoordinatorNodeClient,
+    Ack,
+    ProteanConfigProto,
+    BootstrapPeerRequest,
+    CreatePeersRequest, DeletePeersRequest, ChurnPeersRequest,
+    DriftPeerProto, DriftPeerRequest,
+    QueryRequest, QueryResponse,
+    SnapshotRequest, NetworkSnapshot,
+    WorkerInfo, RouteMessageRequest,
+    ProteanEventType, 
+    StateChangedEvent,
+    QueryCompletedEvent,
+    BootstrapCompletedEvent,
+    ProteanEventProto,
 };
-use crate::proto::protean::SnvConfigProto;
+use crate::proto::protean::{SnvConfigProto, PeerProto};
 use crate::worker::actor::{ControlMessage, ActorProtean};
 
 use protean::{
@@ -31,26 +42,6 @@ use protean::{
     uuid::Uuid,
 };
 
-struct EmbeddingPool<S: EmbeddingSpace> {
-    embeddings: HashMap<u64, S::EmbeddingData>,
-}
-
-impl<S: EmbeddingSpace> EmbeddingPool<S> {
-    fn new() -> Self {
-        Self {
-            embeddings: HashMap::new(),
-        }
-    }
-
-    fn get(&self, global_idx: u64) -> Option<S::EmbeddingData> {
-        self.embeddings.get(&global_idx).cloned()
-    }
-
-    fn insert(&mut self, global_idx: u64, embedding: S::EmbeddingData) {
-        self.embeddings.insert(global_idx, embedding);
-    }
-}
-
 pub struct Worker<S: EmbeddingSpace> {
     worker_id: String,
     my_address: Arc<RwLock<Address>>,
@@ -58,11 +49,10 @@ pub struct Worker<S: EmbeddingSpace> {
     /// gRPC connections to other worker
     workers: Arc<DashMap<Address, WorkerNodeClient<Channel>>>,
 
-    /// gRPC connection to the coordinator (lazily connected)
-    coordinator: Arc<RwLock<Option<CoordinatorNodeClient<Channel>>>>,
+    /// gRPC connection to the coordinator
+    coordinator: CoordinatorNodeClient<Channel>,
 
-    /// Address of the coordinator for lazy connection
-    coordinator_address: Option<String>,
+    coordinator_address: Address,
 
     /// Channels to deliver message to other nodes
     actor_protocol_channels: Arc<DashMap<Uuid, UnboundedSender<ProteanMessage<S>>>>,
@@ -74,47 +64,37 @@ pub struct Worker<S: EmbeddingSpace> {
     /// Config for making new peers
     actor_config: Arc<RwLock<ProteanConfig>>,
 
-    /// Embedding pool for this worker (indexed by local index)
-    embedding_pool: Arc<RwLock<EmbeddingPool<S>>>,
+    /// Cached bootstrap peers for entering peers
+    bootstrap_servers: Arc<RwLock<Vec<ProteanPeer<S>>>>,
 }
 
 impl<S: EmbeddingSpace> Worker<S> {
-    pub fn new(worker_id: String, my_address: Address, coordinator_address: Option<String>) -> Self {
+    pub async fn new(worker_id: String, my_address: Address, coordinator_address: Address) -> Result<Self, Status> {
         // Use the current tokio runtime handle instead of creating a new one
         // This avoids the "Cannot drop a runtime in a context where blocking is not allowed" panic
         let runtime_handle = Handle::current();
 
-        Self {
+        let coordinator_client=  Self::get_coordinator_client(coordinator_address.clone()).await?;
+
+        Ok(Self {
             worker_id,
             my_address: Arc::new(RwLock::new(my_address)),
             workers: Arc::new(DashMap::new()),
-            coordinator: Arc::new(RwLock::new(None)),
+            coordinator: coordinator_client,
             coordinator_address,
             actor_protocol_channels: Arc::new(DashMap::new()),
             actor_control_channels: Arc::new(DashMap::new()),
             runtime_handle,
             actor_config: Arc::new(RwLock::new(ProteanConfig::default())),
-            embedding_pool: Arc::new(RwLock::new(EmbeddingPool::new())),
-        }
+            bootstrap_servers: Arc::new(RwLock::new(Vec::new())),
+        })
     }
 
     /// Get or create coordinator client (lazy connection)
-    async fn get_coordinator_client(&self) -> Result<CoordinatorNodeClient<Channel>, Status> {
-        // Check if we already have a connection
-        {
-            let guard = self.coordinator.read()
-                .map_err(|_| Status::internal("Failed to acquire coordinator read lock"))?;
-            if let Some(ref client) = *guard {
-                return Ok(client.clone());
-            }
-        }
+    async fn get_coordinator_client(coordinator_address: Address) -> Result<CoordinatorNodeClient<Channel>, Status> {
 
-        // Need to connect - get the address
-        let addr = self.coordinator_address.as_ref()
-            .ok_or_else(|| Status::failed_precondition("Coordinator address not configured"))?;
-
-        let url = format!("http://{}", addr);
-        tracing::info!("[{}] Connecting to coordinator at {}", self.worker_id, url);
+        let url = format!("http://{}", coordinator_address);
+        tracing::info!("Connecting to coordinator at {}", url);
 
         let client = CoordinatorNodeClient::connect(url.clone())
             .await
@@ -122,31 +102,30 @@ impl<S: EmbeddingSpace> Worker<S> {
             .max_decoding_message_size(100 * 1024 * 1024)
             .max_encoding_message_size(100 * 1024 * 1024);
 
-        // Store the client
-        {
-            let mut guard = self.coordinator.write()
-                .map_err(|_| Status::internal("Failed to acquire coordinator write lock"))?;
-            *guard = Some(client.clone());
-        }
-
-        tracing::info!("[{}] Connected to coordinator", self.worker_id);
+        tracing::info!("Connected to coordinator at {}", coordinator_address);
         Ok(client)
     }
 
-    /// Convert global dataset index to UUID
-    /// UUIDs are derived deterministically from global indices
-    pub(crate) fn global_index_to_uuid(global_index: u64) -> Uuid {
-        let mut bytes = [0u8; 64];
-        bytes[0..8].copy_from_slice(&global_index.to_be_bytes());
-        Uuid::from_bytes(bytes)
-    }
+    fn new_actor(&mut self, uuid: &Uuid, embedding: S::EmbeddingData, config: ProteanConfig) -> ActorProtean<S> {
+        let (protocol_tx, protocol_rx) = unbounded_channel();
+        let (control_tx, control_rx) = unbounded_channel();
 
-    /// Convert UUID back to global dataset index
-    #[allow(dead_code)]
-    pub(crate) fn uuid_to_global_index(uuid: &Uuid) -> u64 {
-        let bytes = uuid.as_bytes();
-        // Safe: we know bytes is at least 64 bytes, so first 8 bytes always exist
-        u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0u8; 8]))
+        self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
+        self.actor_control_channels.insert(uuid.clone(), control_tx.clone());
+
+        ActorProtean::new(
+            self.my_address.clone(), 
+            uuid.clone(), 
+            embedding, 
+            config,
+            protocol_rx, 
+            control_rx, 
+            self.actor_protocol_channels.clone(),
+            self.coordinator.clone(), 
+            self.workers.clone(),
+            Duration::from_millis(10), 
+            config.snv_config.max_exploration_interval,
+        )
     }
 
 }
@@ -156,132 +135,41 @@ impl<S: EmbeddingSpace + Send + Sync + 'static> WorkerNode for Worker<S>
 where
     S::EmbeddingData: Send + Sync + Embedding<Scalar = f32>,
 {
-    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<Ack>, Status> {
-        Ok(Response::new(Ack {
-            success: true,
-            message: format!("Worker {} is healthy", self.worker_id),
-        }))
-    }
+    async fn set_config(&self, request: Request<ProteanConfigProto>) -> Result<Response<Ack>, Status> {
+        let protean_config_proto: ProteanConfigProto = request.into_inner().into();
+        if let Some(snv_config_proto) = protean_config_proto.snv_config {
+            let snv_config: SnvConfig = snv_config_proto.into();
 
-    async fn set_config(&self, request: Request<SnvConfigProto>) -> Result<Response<Ack>, Status> {
-        let snv_config: SnvConfig = request.into_inner().into();
-        match self.actor_config.write() {
-            Ok(mut config) => {
-                config.snv_config = snv_config;
-                Ok(Response::new(Ack { success: true, message: "Configuration updated".to_string() }))
-            }
-            Err(e) => Err(Status::internal(format!("Failed to acquire config lock: {}", e))),
+            let mut local_config = self.actor_config.write().await;
+            *local_config = ProteanConfig { 
+                timeout: Duration::from_secs(protean_config_proto.timeout_sec),
+                snv_config, 
+                max_concurrent_queries: protean_config_proto.max_concurrent_queries as usize,
+            };
+            Ok(Response::new(Ack {}))
+        } else {
+            Err(Status::invalid_argument("SnvConfig missing from ProteanConfigProto"))
         }
     }
 
-    async fn load_embeddings(&self, request: Request<LoadEmbeddingsRequest>) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-
-        match self.embedding_pool.write() {
-            Ok(mut pool) => {
-                let mut count = 0;
-                for indexed_emb in req.embeddings.into_iter() {
-                    let global_idx = indexed_emb.global_idx;
-                    match indexed_emb.embeddings {
-                        Some(tensor_proto) => {
-                            match S::EmbeddingData::try_from(tensor_proto) {
-                                Ok(embedding) => {
-                                    pool.insert(global_idx, embedding);
-                                    count += 1;
-                                }
-                                Err(e) => return Err(Status::invalid_argument(
-                                    format!("Failed to convert embedding at index {}: {:?}", global_idx, e)
-                                )),
-                            }
-                        }
-                        None => return Err(Status::invalid_argument(
-                            format!("Missing embedding data at index {}", global_idx)
-                        )),
-                    }
-                }
-                Ok(Response::new(Ack {
-                    success: true,
-                    message: format!("Loaded {} embeddings", count)
-                }))
-            }
-            Err(e) => Err(Status::internal(format!("Failed to acquire embedding pool lock: {}", e))),
-        }
+    async fn set_bootstrap_servers(&self, request: Request<BootstrapPeerRequest>) -> Result<Response<Ack>, Status> {
+        let bootstrap_peer_request = request.into_inner();
+        
+        let bootstrap_servers = self.bootstrap_servers.write().await;
+        *bootstrap_servers = bootstrap_peer_request.bs_server.iter().map(|peer_proto| peer_proto.into()).collect();
+        Ok(Response::new(Ack {}))
     }
 
     async fn create_peers(&self, request: Request<CreatePeersRequest>) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
+        let create_peers_request = request.into_inner();
         let mut created_count = 0;
 
-        // Get coordinator client (lazy connection)
-        let coordinator = self.get_coordinator_client().await?;
+        let config = self.actor_config.read().await.clone();
 
-        let config = match self.actor_config.read() {
-            Ok(guard) => guard.clone(),
-            Err(e) => return Err(Status::internal(format!("Config lock error: {}", e))),
-        };
-
-        let max_step_interval = config.snv_config.max_exploration_interval;
-
-        for global_index in req.global_indices.iter() {
-            let uuid = Self::global_index_to_uuid(*global_index);
-
-            let embedding = match self.embedding_pool.read() {
-                Ok(pool) => match pool.get(*global_index) {
-                    Some(e) => e,
-                    None => { tracing::warn!("Embedding not found for index {}", global_index); continue; }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to read embedding pool: {}", e);
-                    continue;
-                }
-            };
-
-            let (protocol_tx, protocol_rx) = unbounded_channel();
-            let (control_tx, control_rx) = unbounded_channel();
-
-            self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
-            self.actor_control_channels.insert(uuid.clone(), control_tx.clone());
-
-            let actor = ActorProtean::new(
-                self.my_address.clone(), uuid.clone(), embedding, config.clone(),
-                protocol_rx, control_rx, self.actor_protocol_channels.clone(),
-                coordinator.clone(), self.workers.clone(),
-                Duration::from_millis(10), max_step_interval,
-            );
-
-            self.runtime_handle.spawn(actor.run());
-            created_count += 1;
-
-            if let Some(ref bootstrap_info) = req.bootstrap_peer {
-                match bootstrap_info.embedding.as_ref() {
-                    Some(emb_proto) => {
-                        match S::EmbeddingData::try_from(emb_proto.clone()) {
-                            Ok(bootstrap_emb) => {
-                                if control_tx.send(ControlMessage::Bootstrap {
-                                    contact_point: ProteanPeer {
-                                        embedding: bootstrap_emb,
-                                        peer: Peer {
-                                            uuid: Uuid::from_slice(&bootstrap_info.uuid),
-                                            address: bootstrap_info.worker_address.clone(),
-                                        },
-                                    },
-                                    config: None,
-                                }).is_err() {
-                                    tracing::warn!("Failed to send bootstrap command to peer {}", uuid);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to convert bootstrap embedding for peer {}: {:?}", uuid, e);
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!("Bootstrap peer info missing embedding for peer {}", uuid);
-                    }
-                }
-            }
-        }
-
+        // for peer:
+        //      create peer
+        //      send bootstrap command
+        
         Ok(Response::new(Ack { success: true, message: format!("Created {} peers", created_count) }))
     }
 

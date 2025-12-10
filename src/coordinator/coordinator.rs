@@ -15,12 +15,9 @@ use crate::proto::dist_sim::worker_node_client::WorkerNodeClient;
 use crate::proto::dist_sim::*;
 use crate::proto::protean::TensorProto;
 
-use super::constrained_kmeans::ClusteredData;
+use super::constrained_kmeans::PartitionedData;
 use super::dataloader::DataLoader;
 use super::snapshot::{GlobalSnapshot, ParsedSnapshot};
-use super::test_plan::{
-    BootstrapPhase, ChurnPhase, ChurnPatternType, QueryPhase, SnapshotPhase, TestPhase, TestPlan, WaitPhase,
-};
 
 /// Query identifier: (query_index, source_peer_index)
 pub type QueryId = (usize, u64);
@@ -89,8 +86,8 @@ pub struct Coordinator<S: EmbeddingSpace> {
     // Worker registry (address -> worker entry)
     workers: Arc<DashMap<String, WorkerEntry>>,
 
-    // Dataset (full dataset loaded and clustered in coordinator)
-    clustered_data: ClusteredData<S>,
+    // Dataset (partitioned by modulo for distribution to workers)
+    data: PartitionedData<S>,
 
     // Index of next cluster to assign
     assigned_cluster_idx: Arc<AtomicUsize>,
@@ -138,17 +135,11 @@ where
             return Err("Dataset not available after download".into());
         };
 
-        let mut clustered_data = ClusteredData::new(
-            config.workers_capacity,
-            config.num_workers,
-            dataset,
-        );
-
-        clustered_data.fit();
+        let data = PartitionedData::new(dataset);
 
         Ok(Self {
             workers: Arc::new(DashMap::new()),
-            clustered_data,
+            data,
             assigned_cluster_idx: Arc::new(AtomicUsize::new(0)),
             test_plan,
             events: Arc::new(Mutex::new(VecDeque::new())),

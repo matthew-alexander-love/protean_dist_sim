@@ -7,21 +7,26 @@ option optimize_for = LITE_RUNTIME;
 import "onnx-ml.proto";
 import "protean.proto";
 
+// Considering add Lamport clock for tracing, but getting this working first.
+
 /* --------------------- Services --------------------- */
 
 service WorkerNode {
     // Lifecycle & Configuration
     /// Set worker-wide simulation configuration
-    rpc SetConfig(protean_proto.SnvConfigProto) returns (Ack) {}
+    rpc SetConfig(ProteanConfigProto) returns (Ack) {}
 
-    /// Load embeddings into worker's embedding pool
-    rpc LoadEmbeddings(LoadEmbeddingsRequest) returns (Ack) {}
+    /// Sets Bootstrap Servers
+    rpc SetBootstrapServers(BootstrapPeerRequest) returns (Ack) {}
 
-    /// Create multiple peers at once (for bootstrapping)
+    /// Create new peers (for bootstrapping)
     rpc CreatePeers(CreatePeersRequest) returns (Ack) {}
 
     /// Delete specific peers by UUID
     rpc DeletePeers(DeletePeersRequest) returns (Ack) {}
+
+    /// Delete and create new peers
+    rpc ChurnPeers(ChurnPeersRequest) returns (Ack) {}
 
     /// Start a Churn Pattern
     rpc DriftPeer(DriftPeerRequest) returns (Ack) {}
@@ -36,9 +41,6 @@ service WorkerNode {
 
     /// Load network state from snapshot
     rpc LoadSnapshot(NetworkSnapshot) returns (Ack) {}
-
-    /// Health check
-    rpc Ping(PingRequest) returns (Ack) {} //
 
     /// Inform about another worker that can be sent messages
     rpc RegisterWorker(WorkerInfo) returns (Ack) {}
@@ -59,52 +61,41 @@ service CoordinatorNode {
 /* --------------------- Common Messages --------------------- */
 
 message Ack {
-    bool success = 1;
-    string message = 2;
-}
-
-message PingRequest {
-    // Empty - just a health check
-}
-
-/* --------------------- Embedding Management Messages --------------------- */
-
-message IndexedEmbeddingProto {
-    onnx.TensorProto embeddings = 1;
-    uint64 global_idx = 2;
-}
-
-/// Request to load embeddings into worker's embedding pool
-message LoadEmbeddingsRequest {
-    repeated IndexedEmbeddingProto embeddings = 1;
 }
 
 /* --------------------- Peer Lifecycle Messages --------------------- */
+/// Config for peer creation
+message ProteanConfigProto {
+    uint64 timeout_sec = 1;
+    uint32 max_concurrent_queries = 2;
+    protean_proto.SnvConfigProto snv_config = 3;
+}
 
 /// Bootstrap peer information for peer creation
-message BootstrapPeerInfo {
-    bytes uuid = 1;                      // UUID of bootstrap peer
-    onnx.TensorProto embedding = 2;      // Embedding of bootstrap peer
-    string worker_address = 3;           // Address of worker hosting bootstrap peer
+message BootstrapPeerRequest {
+    repeated protean_proto.PeerProto bs_server = 1;
 }
 
 /// Request to create multiple peers
 message CreatePeersRequest {
-    repeated uint64 global_indices = 1;  // Global dataset indices for peers to create
-    uint64 bootstrap_index = 2;          // DEPRECATED: Global index of bootstrap peer (use bootstrap_peer instead)
-    BootstrapPeerInfo bootstrap_peer = 3; // Bootstrap peer information (optional)
+    repeated protean proto.PeerProto peers = 1;
 }
 
 /// Request to delete specific peers
 message DeletePeersRequest {
-    repeated uint64 global_indices = 1;  // Global indices of peers to delete
+    repeated bytes uuids = 1;
+}
+
+message ChurnPeersRequest {
+    CreatePeersRequest create = 1;
+    DeletePeersRequest delete = 2;
 }
 
 message DriftPeerProto {
-    bytes peer_uuid = 1;        // UUID of the peer to drift
-    uint64 target_idx = 2;      // Global index of target embedding to drift towards
-    uint64 num_steps = 3;       // Number of drift steps
-    uint64 update_interval_ms = 4;  // Interval between drift updates in milliseconds
+    bytes uuid = 1;
+    onnx.TensorProto target_embedding = 2;
+    uint64 drift_steps = 3;       // Number of drift steps
+    uint64 duration_per_step_sec = 4;  // Interval between drift updates in milliseconds
 }
 
 message DriftPeerRequest {
@@ -121,7 +112,7 @@ message QueryRequest {
     protean_proto.QueryConfigProto config = 4;  // Query execution config
 }
 
-/// Response containing query UUID (results come via event forwarding)
+/// Response containing query UUID
 message QueryResponse {
     bytes query_uuid = 1;  // Unique query identifier
 }
@@ -135,7 +126,6 @@ message SnapshotRequest {
 
 /// Complete network snapshot
 message NetworkSnapshot {
-    uint64 timestamp_ms = 1;  // Snapshot timestamp
     string worker_id = 2;      // Worker that generated this snapshot
     repeated protean_proto.SparseNeighborViewProto peer_snapshots = 3;
 }
@@ -145,15 +135,7 @@ message NetworkSnapshot {
 /// Worker information for registration
 /// Peers dont need to know there centroid
 message WorkerInfo {
-    string address = 1;           // gRPC address of worker (host:port)
-}
-
-/// Heartbeat from worker to coordinator
-message HeartbeatRequest {
-    string worker_id = 1;
-    uint32 active_peers = 2;      // Current number of active peers
-    float cpu_usage = 3;           // CPU usage percentage (0-100)
-    float memory_usage = 4;        // Memory usage percentage (0-100)
+    string address = 1; // gRPC address of worker (host:port)
 }
 
 /* --------------------- Message Routing Messages --------------------- */
@@ -170,7 +152,6 @@ message RouteMessageRequest {
 enum ProteanEventType {
     STATE_CHANGED = 0;
     QUERY_COMPLETED = 1;
-    BOOTSTRAP_CONVERGING_COMPLETED = 2;
     BOOTSTRAP_COMPLETED = 3;
 }
 
@@ -187,12 +168,6 @@ message QueryCompletedEvent {
     bytes query_uuid = 2;
     repeated protean_proto.QueryCandidateProto candidates = 3;
     uint32 hops = 4;
-    uint64 latency_ms = 5;
-}
-
-/// Event: Bootstrap converging phase completed
-message BootstrapConvergingCompletedEvent {
-    bytes peer_uuid = 1;
 }
 
 /// Event: Bootstrap fully completed
@@ -203,12 +178,10 @@ message BootstrapCompletedEvent {
 /// Unified event message
 message ProteanEventProto {
     ProteanEventType event_type = 1;
-    uint64 timestamp_ms = 3;  // Event timestamp (ms since epoch)
 
     oneof event {
         StateChangedEvent state_changed = 4;
         QueryCompletedEvent query_completed = 5;
-        BootstrapConvergingCompletedEvent bootstrap_converging_completed = 6;
         BootstrapCompletedEvent bootstrap_completed = 7;
     }
 }
