@@ -54,7 +54,7 @@ pub(crate) struct DriftState<S: EmbeddingSpace> {
     pub target_embedding: S::EmbeddingData,
     /// Deadline for the next drift update
     pub next_update_deadline: Instant,
-    /// Interval between drift updates
+    /// Interval between drift updates in sec
     pub update_interval: Duration,
     /// Current drift step (0 = at original, total_steps = at target)
     pub current_step: u32,
@@ -101,7 +101,6 @@ where
     },
     /// Start embedding drift towards a target
     StartDrift {
-        original_embedding: S::EmbeddingData,
         target_embedding: S::EmbeddingData,
         update_interval: Duration,
         total_steps: u32,
@@ -300,11 +299,9 @@ where
                 ProteanEventProto {
                     event_type: ProteanEventType::BootstrapConvergingCompleted as i32,
                     timestamp_ms,
-                    event: Some(protean_event_proto::Event::BootstrapConvergingCompleted(
-                        BootstrapConvergingCompletedEvent {
-                            peer_uuid: local_uuid.as_bytes().to_vec(),
-                        }
-                    )),
+                    event: Some(protean_event_proto::Event::BootstrapConvergingCompleted(BootstrapConvergingCompletedEvent {
+                        peer_uuid: local_uuid.as_bytes().to_vec(),
+                    })),
                 }
             },
             ProteanEvent::BootstrapCompleted { local_uuid } => {
@@ -395,7 +392,8 @@ where
                 let embedding = self.protean.embedding().clone();
                 let _ = response.send(embedding);
             },
-            ControlMessage::StartDrift { original_embedding, target_embedding, update_interval, total_steps } => {
+            ControlMessage::StartDrift { target_embedding, update_interval, total_steps } => {
+                let original_embedding = self.protean.embedding().clone();
                 // Initialize drift state
                 self.drift_state = Some(DriftState {
                     original_embedding,
@@ -523,42 +521,20 @@ where
     }
 
     async fn forward_events(&mut self, events: &[ProteanEvent<S>]) {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY_MS: u64 = 50;
-
         for event in events {
             tracing::debug!("[Actor {}] Event from message processing: {:?}", self.protean.uuid(), event);
             let event_proto = Self::event_to_proto(&event, &self.protean.uuid());
 
-            let mut attempt = 0;
-            let mut last_error = None;
-
-            while attempt < MAX_RETRIES {
-                match self.coordinator.forward_event(Request::new(event_proto.clone())).await {
-                    Ok(_) => {
-                        tracing::trace!("[{}] Successfully forwarded event to coordinator", self.protean.uuid());
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        last_error = Some(e);
-                        if attempt < MAX_RETRIES {
-                            tracing::warn!(
-                                "[{}] Failed to forward event (attempt {}/{}), retrying...",
-                                self.protean.uuid(), attempt, MAX_RETRIES
-                            );
-                            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64)).await;
-                        }
-                    }
+            match self.coordinator.forward_event(Request::new(event_proto)).await {
+                Ok(_) => {
+                    tracing::trace!("[{}] Successfully forwarded event to coordinator", self.protean.uuid());
                 }
-            }
-
-            if let Some(e) = last_error {
-                tracing::error!(
-                    "[{}] Failed to forward event after {} attempts, dropping event: {}",
-                    self.protean.uuid(), MAX_RETRIES, e
-                );
+                Err(e) => {
+                    tracing::error!(
+                        "[{}] Failed to forward event to coordinator: {}",
+                        self.protean.uuid(), e
+                    );
+                }
             }
         }
     }

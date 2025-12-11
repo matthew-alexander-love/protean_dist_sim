@@ -122,12 +122,24 @@ message QueryResponse {
 /// Request for network snapshot
 message SnapshotRequest {
     repeated bytes peer_uuids = 1;  // Specific peers to snapshot (empty = all)
+    string name = 2;  // Name of the snapshot
 }
 
+/// Snapshot of a single SNV
+message SnvSnapshotProto {
+    uint32 total_peers = 1;
+    uint32 routable_peers = 2;
+    uint32 suspect_peers = 3;
+    uint32 pending_pings = 4;
+    uint32 inflight_pings = 5;
+    uint32 dynamism = 6;
+}
 /// Complete network snapshot
 message NetworkSnapshot {
     string worker_id = 2;      // Worker that generated this snapshot
     repeated protean_proto.SparseNeighborViewProto peer_snapshots = 3;
+    repeated bytes peer_uuids = 4;  // Uuids of the peers in the snapshot
+    repeated SnvSnapshotProto snv_snapshots = 5;  // SNV snapshots of the peers
 }
 
 /* --------------------- Worker Registration Messages --------------------- */
@@ -152,6 +164,7 @@ message RouteMessageRequest {
 enum ProteanEventType {
     STATE_CHANGED = 0;
     QUERY_COMPLETED = 1;
+    BOOTSTRAP_CONVERGING_COMPLETED = 2;
     BOOTSTRAP_COMPLETED = 3;
 }
 
@@ -170,6 +183,11 @@ message QueryCompletedEvent {
     uint32 hops = 4;
 }
 
+/// Event: Bootstrap converging phase completed
+message BootstrapConvergingCompletedEvent {
+    bytes peer_uuid = 1;
+}
+
 /// Event: Bootstrap fully completed
 message BootstrapCompletedEvent {
     bytes peer_uuid = 1;
@@ -182,6 +200,7 @@ message ProteanEventProto {
     oneof event {
         StateChangedEvent state_changed = 4;
         QueryCompletedEvent query_completed = 5;
+        BootstrapConvergingCompletedEvent bootstrap_converging_completed = 6;
         BootstrapCompletedEvent bootstrap_completed = 7;
     }
 }

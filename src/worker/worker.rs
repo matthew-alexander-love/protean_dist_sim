@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -19,7 +18,7 @@ use crate::proto::dist_sim::{
     CreatePeersRequest, DeletePeersRequest, ChurnPeersRequest,
     DriftPeerProto, DriftPeerRequest,
     QueryRequest, QueryResponse,
-    SnapshotRequest, NetworkSnapshot,
+    SnapshotRequest, NetworkSnapshot, SnvSnapshotProto,
     WorkerInfo, RouteMessageRequest,
     ProteanEventType, 
     StateChangedEvent,
@@ -27,7 +26,7 @@ use crate::proto::dist_sim::{
     BootstrapCompletedEvent,
     ProteanEventProto,
 };
-use crate::proto::protean::{SnvConfigProto, PeerProto};
+use crate::proto::protean::SparseNeighborViewProto;
 use crate::worker::actor::{ControlMessage, ActorProtean};
 
 use protean::{
@@ -66,12 +65,11 @@ pub struct Worker<S: EmbeddingSpace> {
 
     /// Cached bootstrap peers for entering peers
     bootstrap_servers: Arc<RwLock<Vec<ProteanPeer<S>>>>,
+    bootstrap_peer_idx: Mutex<usize>,
 }
 
 impl<S: EmbeddingSpace> Worker<S> {
     pub async fn new(worker_id: String, my_address: Address, coordinator_address: Address) -> Result<Self, Status> {
-        // Use the current tokio runtime handle instead of creating a new one
-        // This avoids the "Cannot drop a runtime in a context where blocking is not allowed" panic
         let runtime_handle = Handle::current();
 
         let coordinator_client=  Self::get_coordinator_client(coordinator_address.clone()).await?;
@@ -87,6 +85,7 @@ impl<S: EmbeddingSpace> Worker<S> {
             runtime_handle,
             actor_config: Arc::new(RwLock::new(ProteanConfig::default())),
             bootstrap_servers: Arc::new(RwLock::new(Vec::new())),
+            bootstrap_peer_idx: Mutex::new(0),
         })
     }
 
@@ -106,14 +105,14 @@ impl<S: EmbeddingSpace> Worker<S> {
         Ok(client)
     }
 
-    fn new_actor(&mut self, uuid: &Uuid, embedding: S::EmbeddingData, config: ProteanConfig) -> ActorProtean<S> {
+    fn new_actor(&self, uuid: &Uuid, embedding: S::EmbeddingData, config: ProteanConfig) -> UnboundedSender<ControlMessage<S>> {
         let (protocol_tx, protocol_rx) = unbounded_channel();
         let (control_tx, control_rx) = unbounded_channel();
 
         self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
         self.actor_control_channels.insert(uuid.clone(), control_tx.clone());
 
-        ActorProtean::new(
+        let actor = ActorProtean::new(
             self.my_address.clone(), 
             uuid.clone(), 
             embedding, 
@@ -125,7 +124,87 @@ impl<S: EmbeddingSpace> Worker<S> {
             self.workers.clone(),
             Duration::from_millis(10), 
             config.snv_config.max_exploration_interval,
-        )
+        );
+
+        self.runtime_handle.spawn(actor.run())?;
+        control_tx
+    }
+
+    async fn new_actor_from_proto(&self, uuid: &Uuid, proto: SparseNeighborViewProto) -> Result<UnboundedSender<ControlMessage<S>>, Status> {
+        let (protocol_tx, protocol_rx) = unbounded_channel();
+        let (control_tx, control_rx) = unbounded_channel();
+
+        self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
+        self.actor_control_channels.insert(uuid.clone(), control_tx.clone());
+
+        let config = self.actor_config.read().await.clone();
+        let actor = ActorProtean::from_proto(
+            self.my_address.clone(),
+            proto,
+            config.clone(),
+            protocol_rx,
+            control_rx,
+            self.actor_protocol_channels.clone(),
+            self.coordinator.clone(),
+            self.workers.clone(),
+            Duration::from_millis(10),
+            config.snv_config.max_exploration_interval,
+        ).map_err(|e| Status::internal(format!("Failed to create actor from snapshot: {:?}", e)))?;
+
+        self.runtime_handle.spawn(actor.run());
+        control_tx
+    }
+
+
+    async fn get_bootstrap_server(&self) -> Result<ProteanPeer<S>, Status> {
+        let bootstrap_servers = self.bootstrap_servers.read().await;
+        let bootstrap_len: usize = *bootstrap_servers.len();
+        if bootstrap_len == 0 {
+            return Err(Status::failed_precondition("No bootstrap servers configured"));
+        }
+        let mut idx_guard = self.bootstrap_peer_idx.lock().unwrap();
+        let idx = *idx_guard % bootstrap_len;
+        *idx_guard = idx_guard.wrapping_add(1);
+        let bootstrap_peer = bootstrap_servers[idx];
+        Ok(bootstrap_peer)
+    }
+
+    async fn bootstrap_peer(&self, peer_control_tx: UnboundedSender<ControlMessage<S>>) -> Result<(), Status> {
+        let bootstrap_peer = self.get_bootstrap_server().await?;
+        let bs_cmd = ControlMessage::Bootstrap {
+            contact_point: bootstrap_peer,
+            config: None,
+        };
+        peer_control_tx.send(bs_cmd).map_err(|_| Status::internal("Failed to send bootstrap command"))?;
+        Ok(())
+    }
+
+    async fn create_peers(&self, peers: Vec<ProteanPeer<S>>) -> Result<(), Status> {
+        let config = self.actor_config.read().await.clone();
+        let bootstrap_servers = self.bootstrap_servers.read().await.clone();
+        let bootstrap_len = bootstrap_servers.len();
+
+        if bootstrap_len == 0 {
+            return Err(Status::failed_precondition("No bootstrap servers configured"));
+        }
+
+        for (idx, peer) in peers.into_iter().enumerate() {
+            let peer_control_tx: UnboundedSender<ControlMessage<S>> = self.new_actor(&peer.uuid, peer.embedding, config.clone());
+
+            self.bootstrap_peer(peer_control_tx).await?;
+
+        }
+
+        Ok(())
+    }
+
+    async fn delete_peers(&self, uuids: Vec<Uuid>) -> Result<(), Status> {
+        for uuid in uuids.iter() {
+            if let Some(control_tx) = self.actor_control_channels.get(&uuid) {
+                control_tx.send(ControlMessage::Shutdown).map_err(|_| Status::internal("Failed to send shutdown command"))?;
+            }
+        }
+        Ok(())
     }
 
 }
@@ -136,6 +215,7 @@ where
     S::EmbeddingData: Send + Sync + Embedding<Scalar = f32>,
 {
     async fn set_config(&self, request: Request<ProteanConfigProto>) -> Result<Response<Ack>, Status> {
+        tracing::info!("[Worker {}] set_config called", self.worker_id);
         let protean_config_proto: ProteanConfigProto = request.into_inner().into();
         if let Some(snv_config_proto) = protean_config_proto.snv_config {
             let snv_config: SnvConfig = snv_config_proto.into();
@@ -146,249 +226,373 @@ where
                 snv_config, 
                 max_concurrent_queries: protean_config_proto.max_concurrent_queries as usize,
             };
+            tracing::info!(
+                "[Worker {}] Config updated: timeout={}s, max_concurrent_queries={}",
+                self.worker_id,
+                protean_config_proto.timeout_sec,
+                protean_config_proto.max_concurrent_queries
+            );
             Ok(Response::new(Ack {}))
         } else {
+            tracing::warn!("[Worker {}] set_config failed: SnvConfig missing from ProteanConfigProto", self.worker_id);
             Err(Status::invalid_argument("SnvConfig missing from ProteanConfigProto"))
         }
     }
 
     async fn set_bootstrap_servers(&self, request: Request<BootstrapPeerRequest>) -> Result<Response<Ack>, Status> {
         let bootstrap_peer_request = request.into_inner();
+        let num_servers = bootstrap_peer_request.bs_server.len();
+        tracing::info!("[Worker {}] set_bootstrap_servers called with {} servers", self.worker_id, num_servers);
         
-        let bootstrap_servers = self.bootstrap_servers.write().await;
+        let mut bootstrap_servers = self.bootstrap_servers.write().await;
         *bootstrap_servers = bootstrap_peer_request.bs_server.iter().map(|peer_proto| peer_proto.into()).collect();
+        tracing::info!("[Worker {}] Bootstrap servers updated: {} servers configured", self.worker_id, bootstrap_servers.len());
         Ok(Response::new(Ack {}))
     }
 
     async fn create_peers(&self, request: Request<CreatePeersRequest>) -> Result<Response<Ack>, Status> {
         let create_peers_request = request.into_inner();
-        let mut created_count = 0;
+        let num_peers = create_peers_request.peers.len();
+        tracing::info!("[Worker {}] create_peers called: creating {} peers", self.worker_id, num_peers);
 
-        let config = self.actor_config.read().await.clone();
-
-        // for peer:
-        //      create peer
-        //      send bootstrap command
-        
-        Ok(Response::new(Ack { success: true, message: format!("Created {} peers", created_count) }))
+        match self.create_peers(create_peers_request.peers.iter().map(|peer| peer.into()).collect()).await {
+            Ok(_) => {
+                tracing::info!("[Worker {}] Successfully created {} peers", self.worker_id, num_peers);
+                Ok(Response::new(Ack {}))
+            }
+            Err(e) => {
+                tracing::error!("[Worker {}] Failed to create peers: {}", self.worker_id, e);
+                Err(e)
+            }
+        }
     }
 
     async fn delete_peers(&self, request: Request<DeletePeersRequest>) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-        let mut deleted_count = 0;
-        let mut not_found_count = 0;
+        let delete_peers_request: DeletePeersRequest = request.into_inner();
+        let num_uuids = delete_peers_request.uuids.len();
+        tracing::info!("[Worker {}] delete_peers called: deleting {} peers", self.worker_id, num_uuids);
+        
+        let uuids: Vec<Uuid> = delete_peers_request.uuids.iter()
+            .map(|uuid_bytes| Uuid::from_slice(uuid_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                tracing::warn!("[Worker {}] delete_peers failed: Invalid UUID in request: {:?}", self.worker_id, e);
+                Status::invalid_argument("Invalid UUID in request")
+            })?;
 
-        // First, send shutdown signals to all peers
-        for global_index in req.global_indices.iter() {
-            let uuid = Self::global_index_to_uuid(*global_index);
-            if let Some(tx) = self.actor_control_channels.get(&uuid) {
-                if tx.send(ControlMessage::Shutdown).is_ok() {
-                    deleted_count += 1;
-                }
-            } else {
-                not_found_count += 1;
+        match self.delete_peers(uuids.clone()).await {
+            Ok(_) => {
+                tracing::info!("[Worker {}] Successfully deleted {} peers", self.worker_id, uuids.len());
+                Ok(Response::new(Ack {}))
+            }
+            Err(e) => {
+                tracing::error!("[Worker {}] Failed to delete peers: {}", self.worker_id, e);
+                Err(e)
+            }
+        }
+    }
+
+    async fn churn_peers(&self, request: Request<ChurnPeersRequest>) -> Result<Response<Ack>, Status> {
+        let churn_peers_request = request.into_inner();
+        let num_create = churn_peers_request.create.peers.len();
+        let num_delete = churn_peers_request.delete.uuids.len();
+        tracing::info!(
+            "[Worker {}] churn_peers called: creating {} peers, deleting {} peers",
+            self.worker_id,
+            num_create,
+            num_delete
+        );
+
+        match self.create_peers(churn_peers_request.create.peers.iter().map(|peer| peer.into()).collect()).await {
+            Ok(_) => {
+                tracing::debug!("[Worker {}] Successfully created {} peers during churn", self.worker_id, num_create);
+            }
+            Err(e) => {
+                tracing::error!("[Worker {}] Failed to create peers during churn: {}", self.worker_id, e);
+                return Err(e);
             }
         }
 
-        // Give actors a moment to process shutdown before removing channels
-        // This helps ensure the shutdown message is delivered
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let uuids: Vec<Uuid> = churn_peers_request.delete.uuids.iter()
+            .map(|uuid_bytes| Uuid::from_slice(uuid_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                tracing::warn!("[Worker {}] churn_peers failed: Invalid UUID in delete list: {:?}", self.worker_id, e);
+                Status::invalid_argument("Invalid UUID in delete list")
+            })?;
 
-        // Now remove channels (actors should have received shutdown by now)
-        for global_index in req.global_indices.iter() {
-            let uuid = Self::global_index_to_uuid(*global_index);
-            self.actor_protocol_channels.remove(&uuid);
-            self.actor_control_channels.remove(&uuid);
+        match self.delete_peers(uuids.clone()).await {
+            Ok(_) => {
+                tracing::info!(
+                    "[Worker {}] Successfully churned peers: created {}, deleted {}",
+                    self.worker_id,
+                    num_create,
+                    uuids.len()
+                );
+                Ok(Response::new(Ack {}))
+            }
+            Err(e) => {
+                tracing::error!("[Worker {}] Failed to delete peers during churn: {}", self.worker_id, e);
+                Err(e)
+            }
         }
-
-        if not_found_count > 0 {
-            tracing::warn!("delete_peers: {} peers not found", not_found_count);
-        }
-
-        Ok(Response::new(Ack { success: true, message: format!("Deleted {} peers ({} not found)", deleted_count, not_found_count) }))
     }
 
     async fn drift_peer(&self, request: Request<DriftPeerRequest>) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-        let mut drift_count = 0;
+        let drift_peer_request = request.into_inner();
+        let num_drifts = drift_peer_request.drifts.len();
+        tracing::info!("[Worker {}] drift_peer called: {} drift requests", self.worker_id, num_drifts);
 
-        for drift in req.drifts.iter() {
-            let peer_uuid = Uuid::from_slice(&drift.peer_uuid);
-
-            // Get the peer's current embedding as the original
-            let original_embedding = {
-                let control_tx = match self.actor_control_channels.get(&peer_uuid) {
-                    Some(tx) => tx,
-                    None => { tracing::warn!("Peer {} not found for drift", peer_uuid); continue; }
-                };
-                let (resp_tx, resp_rx) = oneshot::channel();
-                if control_tx.send(ControlMessage::GetEmbedding { response: resp_tx }).is_err() {
-                    tracing::warn!("Failed to send GetEmbedding request to peer {}", peer_uuid);
-                    continue;
-                }
-                match resp_rx.await {
-                    Ok(emb) => emb,
-                    Err(_) => {
-                        tracing::warn!("Failed to receive embedding from peer {}", peer_uuid);
-                        continue;
-                    }
-                }
-            };
-
-            // Get target embedding from pool
-            let target_embedding = match self.embedding_pool.read() {
-                Ok(pool) => match pool.get(drift.target_idx) {
-                    Some(e) => e,
-                    None => { tracing::warn!("Target embedding {} not found", drift.target_idx); continue; }
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to read embedding pool: {}", e);
-                    continue;
-                }
-            };
-
-            if let Some(control_tx) = self.actor_control_channels.get(&peer_uuid) {
-                // Use update_interval_ms from proto, default to 100ms if not specified
-                let update_interval_ms = if drift.update_interval_ms > 0 { drift.update_interval_ms } else { 100 };
-                let _ = control_tx.send(ControlMessage::StartDrift {
-                    original_embedding,
-                    target_embedding,
-                    update_interval: Duration::from_millis(update_interval_ms),
-                    total_steps: drift.num_steps as u32,
-                });
-                drift_count += 1;
+        for drift in drift_peer_request.drifts.iter() {
+            let uuid = Uuid::from_slice(&drift.uuid).map_err(|e| {
+                tracing::warn!("[Worker {}] drift_peer failed: Invalid UUID: {:?}", self.worker_id, e);
+                Status::invalid_argument("Invalid UUID")
+            })?;
+            if drift.drift_steps == 0 {
+                tracing::warn!("[Worker {}] drift_peer failed: drift_steps must be > 0 for peer {}", self.worker_id, uuid);
+                return Err(Status::invalid_argument("drift_steps must be > 0"));
             }
+            let target_embedding = S::EmbeddingData::try_from(drift.target_embedding.clone()).map_err(|e| {
+                tracing::warn!("[Worker {}] drift_peer failed: Invalid target embedding for peer {}: {:?}", self.worker_id, uuid, e);
+                Status::invalid_argument(format!("Invalid target embedding: {:?}", e))
+            })?;
+            let control_tx = self.actor_control_channels.get(&uuid)
+                .ok_or_else(|| {
+                    tracing::warn!("[Worker {}] drift_peer failed: Peer {} not found", self.worker_id, uuid);
+                    Status::not_found(format!("Peer {} not found", uuid))
+                })?;
+            control_tx.send(ControlMessage::StartDrift { 
+                target_embedding: target_embedding, 
+                update_interval: Duration::from_secs(drift.duration_per_step_sec), 
+                total_steps: drift.drift_steps 
+            }).map_err(|e| {
+                tracing::error!("[Worker {}] drift_peer failed: Failed to send drift command to peer {}: {:?}", self.worker_id, uuid, e);
+                Status::internal("Failed to send drift command")
+            })?;
+            tracing::debug!(
+                "[Worker {}] Started drift for peer {}: {} steps, {}ms per step",
+                self.worker_id,
+                uuid,
+                drift.drift_steps,
+                drift.duration_per_step_sec
+            );
         }
-
-        Ok(Response::new(Ack { success: true, message: format!("Started drift for {} peers", drift_count) }))
+        tracing::info!("[Worker {}] Successfully initiated {} drift requests", self.worker_id, num_drifts);
+        Ok(Response::new(Ack {}))
     }
 
     async fn execute_query(&self, request: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
-        let req = request.into_inner();
-        let source_uuid = Uuid::from_slice(&req.source_peer_uuid);
-
-        let query_embedding = match req.query_embedding {
-            Some(tp) => S::EmbeddingData::try_from(tp).map_err(|e| Status::invalid_argument(format!("Invalid embedding: {:?}", e)))?,
-            None => return Err(Status::invalid_argument("Missing query embedding")),
-        };
-
-        let query_config: QueryConfig = req.config.map(QueryConfig::from).unwrap_or_default();
-
+        let query_request: QueryRequest = request.into_inner();
+        let source_uuid = Uuid::from_slice(&query_request.source_peer_uuid).map_err(|e| {
+            tracing::warn!("[Worker {}] execute_query failed: Invalid source UUID: {:?}", self.worker_id, e);
+            Status::invalid_argument("Invalid source UUID")
+        })?;
+        tracing::info!(
+            "[Worker {}] execute_query called: peer={}, k={}",
+            self.worker_id,
+            source_uuid,
+            query_request.k
+        );
+        let query_embedding = S::EmbeddingData::try_from(query_request.query_embedding.clone()).map_err(|e| {
+            tracing::warn!("[Worker {}] execute_query failed: Invalid embedding for peer {}: {:?}", self.worker_id, source_uuid, e);
+            Status::invalid_argument(format!("Invalid embedding: {:?}", e))
+        })?;
+        let query_config: QueryConfig = query_request.config.map(QueryConfig::from).unwrap_or_default();
         let control_tx = self.actor_control_channels.get(&source_uuid)
-            .ok_or_else(|| Status::not_found(format!("Peer {} not found", source_uuid)))?;
-
+            .ok_or_else(|| {
+                tracing::warn!("[Worker {}] execute_query failed: Peer {} not found", self.worker_id, source_uuid);
+                Status::not_found(format!("Peer {} not found", source_uuid))
+            })?;
         let (resp_tx, resp_rx) = oneshot::channel();
-        control_tx.send(ControlMessage::Query { embedding: query_embedding, k: req.k as usize, config: query_config, response: resp_tx })
-            .map_err(|_| Status::internal("Failed to send query"))?;
-
+        control_tx.send(ControlMessage::Query { embedding: query_embedding, k: query_request.k as usize, config: query_config, response: resp_tx })
+            .map_err(|e| {
+                tracing::error!("[Worker {}] execute_query failed: Failed to send query to peer {}: {:?}", self.worker_id, source_uuid, e);
+                Status::internal("Failed to send query")
+            })?;
         match resp_rx.await {
-            Ok(Some(query_uuid)) => Ok(Response::new(QueryResponse { query_uuid: query_uuid.to_bytes() })),
-            Ok(None) => Err(Status::internal("Query failed to start")),
-            Err(_) => Err(Status::internal("Query channel closed")),
+            Ok(Some(query_uuid)) => {
+                tracing::info!("[Worker {}] Query started successfully: peer={}, query_uuid={}", self.worker_id, source_uuid, query_uuid);
+                Ok(Response::new(QueryResponse { query_uuid: query_uuid.to_bytes() }))
+            }
+            Ok(None) => {
+                tracing::error!("[Worker {}] Query failed to start: peer={}", self.worker_id, source_uuid);
+                Err(Status::internal("Query failed to start"))
+            }
+            Err(e) => {
+                tracing::error!("[Worker {}] Query channel closed: peer={}, error={:?}", self.worker_id, source_uuid, e);
+                Err(Status::internal("Query channel closed"))
+            }
         }
     }
 
     async fn get_snapshot(&self, request: Request<SnapshotRequest>) -> Result<Response<NetworkSnapshot>, Status> {
-        let req = request.into_inner();
-        let mut peer_snapshots = Vec::new();
+        let snapshot_request: SnapshotRequest = request.into_inner();
+        let num_requested = snapshot_request.peer_uuids.len();
+        let snapshot_name = if snapshot_request.name.is_empty() { "unnamed" } else { &snapshot_request.name };
+        tracing::info!(
+            "[Worker {}] get_snapshot called: name={}, {} peers requested",
+            self.worker_id,
+            snapshot_name,
+            num_requested
+        );
 
-        let peer_uuids: Vec<Uuid> = if req.peer_uuids.is_empty() {
-            self.actor_control_channels.iter().map(|e| e.key().clone()).collect()
-        } else {
-            req.peer_uuids.iter().map(|b| Uuid::from_slice(b)).collect()
+        let mut snapshot = NetworkSnapshot {
+            worker_id: self.worker_id.clone(),
+            peer_snapshots: Vec::new(),
+            peer_uuids: Vec::new(),
+            snv_snapshots: Vec::new(),
         };
-
-        for uuid in peer_uuids {
+        let mut successful = 0;
+        let mut failed = 0;
+        for uuid_bytes in snapshot_request.peer_uuids.iter() {
+            let uuid = Uuid::from_slice(uuid_bytes).map_err(|e| {
+                tracing::warn!("[Worker {}] get_snapshot failed: Invalid UUID in snapshot request: {:?}", self.worker_id, e);
+                Status::invalid_argument("Invalid UUID in snapshot request")
+            })?;
+            let (resp_tx, resp_rx) = oneshot::channel();
             if let Some(control_tx) = self.actor_control_channels.get(&uuid) {
-                let (resp_tx, resp_rx) = oneshot::channel();
-                if control_tx.send(ControlMessage::GetSnvSnapshot { response: resp_tx }).is_ok() {
-                    if let Ok(snapshot) = resp_rx.await {
-                        peer_snapshots.push(snapshot.proto);
-                    }
+                control_tx.send(ControlMessage::GetSnvSnapshot { response: resp_tx }).map_err(|e| {
+                    tracing::warn!("[Worker {}] get_snapshot failed: Failed to send get snv snapshot command to peer {}: {:?}", self.worker_id, uuid, e);
+                    Status::internal("Failed to send get snv snapshot command")
+                })?;
+            } else {
+                tracing::warn!("[Worker {}] get_snapshot: Peer {} not found, skipping", self.worker_id, uuid);
+                failed += 1;
+                continue;
+            }
+            match resp_rx.await {
+                Ok(actor_snapshot) => {
+                    snapshot.peer_uuids.push(uuid.to_bytes());
+                    snapshot.snv_snapshots.push(SnvSnapshotProto {
+                        total_peers: actor_snapshot.stats.total_peers,
+                        routable_peers: actor_snapshot.stats.routable_peers,
+                        suspect_peers: actor_snapshot.stats.suspect_peers,
+                        pending_pings: actor_snapshot.stats.pending_pings,
+                        inflight_pings: actor_snapshot.stats.inflight_pings,
+                        dynamism: actor_snapshot.stats.dynamism,
+                    });
+                    snapshot.peer_snapshots.push(actor_snapshot.proto);
+                    successful += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("[Worker {}] get_snapshot: Failed to get snapshot from peer {}: {:?}", self.worker_id, uuid, e);
+                    failed += 1;
                 }
             }
         }
 
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        Ok(Response::new(NetworkSnapshot { timestamp_ms, worker_id: self.worker_id.clone(), peer_snapshots }))
+        tracing::info!(
+            "[Worker {}] Snapshot '{}' completed: {} successful, {} failed",
+            self.worker_id,
+            snapshot_name,
+            successful,
+            failed
+        );
+        Ok(Response::new(snapshot))
     }
 
     async fn load_snapshot(&self, request: Request<NetworkSnapshot>) -> Result<Response<Ack>, Status> {
-        let snapshot = request.into_inner();
-        let mut loaded_count = 0;
-
-        // Get coordinator client (lazy connection)
-        let coordinator = self.get_coordinator_client().await?;
-
-        let config = match self.actor_config.read() {
-            Ok(guard) => guard.clone(),
-            Err(e) => return Err(Status::internal(format!("Config lock error: {}", e))),
-        };
-
-        let max_step_interval = config.snv_config.max_exploration_interval;
-
-        for peer_snapshot in snapshot.peer_snapshots {
-            let uuid = Uuid::from_slice(&peer_snapshot.local_uuid);
-
-            let (protocol_tx, protocol_rx) = unbounded_channel();
-            let (control_tx, control_rx) = unbounded_channel();
-
-            self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
-            self.actor_control_channels.insert(uuid.clone(), control_tx);
-
-            match ActorProtean::from_proto(
-                self.my_address.clone(), peer_snapshot, config.clone(),
-                protocol_rx, control_rx, self.actor_protocol_channels.clone(),
-                coordinator.clone(), self.workers.clone(),
-                Duration::from_millis(10), max_step_interval,
-            ) {
-                Ok(actor) => { self.runtime_handle.spawn(actor.run()); loaded_count += 1; }
+        let network_snapshot: NetworkSnapshot = request.into_inner();
+        let num_peers = network_snapshot.peer_snapshots.len();
+        tracing::info!(
+            "[Worker {}] load_snapshot called: worker_id={}, {} peers to load",
+            self.worker_id,
+            network_snapshot.worker_id,
+            num_peers
+        );
+        if network_snapshot.peer_snapshots.len() != network_snapshot.peer_uuids.len() {
+            tracing::error!(
+                "[Worker {}] load_snapshot failed: peer_snapshots ({}) and peer_uuids ({}) length mismatch",
+                self.worker_id,
+                network_snapshot.peer_snapshots.len(),
+                network_snapshot.peer_uuids.len()
+            );
+            return Err(Status::invalid_argument("peer_snapshots and peer_uuids length mismatch"));
+        }
+        let mut successful = 0;
+        let mut failed = 0;
+        for (idx, snv_proto) in network_snapshot.peer_snapshots.into_iter().enumerate() {
+            let uuid = Uuid::from_slice(&network_snapshot.peer_uuids[idx]).map_err(|e| {
+                tracing::warn!("[Worker {}] load_snapshot failed: Invalid UUID at index {}: {:?}", self.worker_id, idx, e);
+                Status::invalid_argument("Invalid UUID in snapshot")
+            })?;
+            match self.new_actor_from_proto(&uuid, snv_proto).await {
+                Ok(peer_control_tx) => {
+                    match self.bootstrap_peer(peer_control_tx).await {
+                        Ok(_) => {
+                            tracing::debug!("[Worker {}] Successfully loaded peer {} from snapshot", self.worker_id, uuid);
+                            successful += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("[Worker {}] load_snapshot: Failed to bootstrap peer {}: {}", self.worker_id, uuid, e);
+                            failed += 1;
+                        }
+                    }
+                }
                 Err(e) => {
-                    tracing::error!("Failed to restore peer {}: {:?}", uuid, e);
-                    self.actor_protocol_channels.remove(&uuid);
-                    self.actor_control_channels.remove(&uuid);
+                    tracing::warn!("[Worker {}] load_snapshot: Failed to create actor for peer {}: {}", self.worker_id, uuid, e);
+                    failed += 1;
                 }
             }
         }
-
-        Ok(Response::new(Ack { success: loaded_count > 0, message: format!("Loaded {} peers", loaded_count) }))
+        tracing::info!(
+            "[Worker {}] Snapshot load completed: {} successful, {} failed",
+            self.worker_id,
+            successful,
+            failed
+        );
+        Ok(Response::new(Ack {}))
     }
 
     async fn register_worker(&self, request: Request<WorkerInfo>) -> Result<Response<Ack>, Status> {
-        let address: Address = request.into_inner().address;
+        let worker_info: WorkerInfo = request.into_inner();
+        tracing::info!("[Worker {}] register_worker called: address={}", self.worker_id, worker_info.address);
 
-        match WorkerNodeClient::connect(format!("http://{}", address)).await {
+        match WorkerNodeClient::connect(format!("http://{}", worker_info.address)).await {
             Ok(client) => {
-                let client = client.max_decoding_message_size(100 * 1024 * 1024).max_encoding_message_size(100 * 1024 * 1024);
-                self.workers.insert(address.clone(), client);
-                tracing::info!("[{}] Registered worker at {}", self.worker_id, address);
-                Ok(Response::new(Ack { success: true, message: format!("Registered worker at {}", address) }))
+                self.workers.insert(worker_info.address.clone(), client);
+                tracing::info!("[Worker {}] Successfully registered worker at {}", self.worker_id, worker_info.address);
+                Ok(Response::new(Ack {}))
             }
             Err(e) => {
-                tracing::error!("[{}] Failed to connect to worker {}: {}", self.worker_id, address, e);
-                Err(Status::unavailable(format!("Failed to connect: {}", e)))
+                tracing::error!("[Worker {}] Failed to register worker at {}: {}", self.worker_id, worker_info.address, e);
+                Err(Status::internal(format!("Failed to connect to worker: {}", e)))
             }
         }
     }
 
     async fn route_message(&self, request: Request<RouteMessageRequest>) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-        let dest_uuid = Uuid::from_slice(&req.destination_uuid);
+        let route_message_request: RouteMessageRequest = request.into_inner();
+        let dest_uuid = Uuid::from_slice(&route_message_request.destination_uuid).map_err(|e| {
+            tracing::warn!("[Worker {}] route_message failed: Invalid destination UUID: {:?}", self.worker_id, e);
+            Status::invalid_argument("Invalid destination UUID")
+        })?;
 
-        let message: ProteanMessage<S> = match req.message {
-            Some(proto) => ProteanMessage::try_from(proto).map_err(|e| Status::invalid_argument(format!("Invalid message: {:?}", e)))?,
-            None => return Err(Status::invalid_argument("Missing message")),
+        let message: ProteanMessage<S> = match route_message_request.message {
+            Some(proto) => ProteanMessage::try_from(proto).map_err(|e| {
+                tracing::warn!("[Worker {}] route_message failed: Invalid message for peer {}: {:?}", self.worker_id, dest_uuid, e);
+                Status::invalid_argument(format!("Invalid message: {:?}", e))
+            })?,
+            None => {
+                tracing::warn!("[Worker {}] route_message failed: Missing message for peer {}", self.worker_id, dest_uuid);
+                return Err(Status::invalid_argument("Missing message"));
+            }
         };
 
+        tracing::debug!("[Worker {}] Routing message to peer {}", self.worker_id, dest_uuid);
         match self.actor_protocol_channels.get(&dest_uuid) {
             Some(ch) => {
-                ch.send(message).map_err(|_| Status::internal("Failed to send message"))?;
-                Ok(Response::new(Ack { success: true, message: String::new() }))
+                ch.send(message).map_err(|e| {
+                    tracing::error!("[Worker {}] route_message failed: Failed to send message to peer {}: {:?}", self.worker_id, dest_uuid, e);
+                    Status::internal("Failed to send message")
+                })?;
+                tracing::debug!("[Worker {}] Successfully routed message to peer {}", self.worker_id, dest_uuid);
+                Ok(Response::new(Ack {}))
             }
-            None => Err(Status::not_found(format!("Peer {} not found", dest_uuid))),
+            None => {
+                tracing::warn!("[Worker {}] route_message failed: Peer {} not found", self.worker_id, dest_uuid);
+                Err(Status::not_found(format!("Peer {} not found", dest_uuid)))
+            }
         }
     }
 }
