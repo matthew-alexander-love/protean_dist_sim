@@ -37,7 +37,7 @@ use crate::proto::dist_sim::{
     worker_node_client::WorkerNodeClient,
     RouteMessageRequest,
     protean_event_proto, ProteanEventType, StateChangedEvent, QueryCompletedEvent,
-    BootstrapCompletedEvent,
+    BootstrapCompletedEvent, BootstrapConvergingCompletedEvent,
     ProteanEventProto,
 };
 
@@ -154,11 +154,8 @@ where
         min_step_interval: Duration,
         max_step_interval: Option<Duration>,
     ) -> Self {
-        // Safe to unwrap: if the lock is poisoned, something is seriously wrong
-        // and we should not create the actor
-        let address = local_address.read()
-            .expect("Address lock poisoned - cannot create actor")
-            .clone();
+        // Use blocking_read for sync context (tokio RwLock)
+        let address = local_address.blocking_read().clone();
         let protean = Protean::new(
             address,
             uuid,
@@ -191,11 +188,8 @@ where
         min_step_interval: Duration,
         max_step_interval: Option<Duration>,
     ) -> Result<Self, ProteanError> {
-        // Note: Using expect here as a poisoned lock indicates a fatal error
-        // from which we cannot meaningfully recover
-        let address = local_address.read()
-            .expect("Address lock poisoned - cannot restore actor from proto")
-            .clone();
+        // Use blocking_read for sync context (tokio RwLock)
+        let address = local_address.blocking_read().clone();
         let protean = Protean::from_proto(address, proto, config)?;
 
         Ok(Self {
@@ -264,17 +258,10 @@ where
 
 
     fn event_to_proto(event: &ProteanEvent<S>, peer_uuid: &Uuid) -> ProteanEventProto {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         match event {
             ProteanEvent::StateChanged { from_state, to_state } => {
                 ProteanEventProto {
                     event_type: ProteanEventType::StateChanged as i32,
-                    timestamp_ms,
                     event: Some(protean_event_proto::Event::StateChanged(StateChangedEvent {
                         peer_uuid: peer_uuid.as_bytes().to_vec(),
                         from_state: format!("{:?}", from_state),
@@ -285,20 +272,17 @@ where
             ProteanEvent::QueryCompleted { local_uuid, result } => {
                 ProteanEventProto {
                     event_type: ProteanEventType::QueryCompleted as i32,
-                    timestamp_ms,
                     event: Some(protean_event_proto::Event::QueryCompleted(QueryCompletedEvent {
                         peer_uuid: local_uuid.as_bytes().to_vec(),
                         query_uuid: result.query_uuid.as_bytes().to_vec(),
                         candidates: result.candidates.iter().map(|c| QueryCandidateProto::from(c.clone())).collect(),
                         hops: 0, // TODO: Track hops in QueryResult
-                        latency_ms: 0, // TODO: Track latency in QueryResult
                     })),
                 }
             },
             ProteanEvent::BootstrapConvergingCompleted { local_uuid } => {
                 ProteanEventProto {
                     event_type: ProteanEventType::BootstrapConvergingCompleted as i32,
-                    timestamp_ms,
                     event: Some(protean_event_proto::Event::BootstrapConvergingCompleted(BootstrapConvergingCompletedEvent {
                         peer_uuid: local_uuid.as_bytes().to_vec(),
                     })),
@@ -307,7 +291,6 @@ where
             ProteanEvent::BootstrapCompleted { local_uuid } => {
                 ProteanEventProto {
                     event_type: ProteanEventType::BootstrapCompleted as i32,
-                    timestamp_ms,
                     event: Some(protean_event_proto::Event::BootstrapCompleted(
                         BootstrapCompletedEvent {
                             peer_uuid: local_uuid.as_bytes().to_vec(),

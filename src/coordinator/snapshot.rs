@@ -110,7 +110,10 @@ impl ParsedSnapshot {
         };
 
         Ok(Self {
-            timestamp_ms: snapshot.timestamp_ms,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             worker_id: snapshot.worker_id,
             peers,
             summary,
@@ -416,6 +419,44 @@ impl GlobalSnapshot {
         path: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let adj_matrix = self.create_global_adjacency_matrix();
+        let json = serde_json::to_string_pretty(&adj_matrix)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Create adjacency matrix for ALL known peers (not just routable)
+    pub fn create_all_peers_adjacency_matrix(&self) -> AdjacencyMatrix {
+        // Create mapping from UUID to matrix index
+        let mut uuid_to_index = HashMap::new();
+        for (idx, peer) in self.peers.iter().enumerate() {
+            uuid_to_index.insert(peer.uuid.clone(), idx);
+        }
+
+        let n = self.peers.len();
+        let mut matrix = vec![vec![0u8; n]; n];
+
+        // Fill adjacency matrix using all_known_peers (not just routable)
+        for (i, peer) in self.peers.iter().enumerate() {
+            for known_peer in &peer.all_known_peers {
+                if let Some(&j) = uuid_to_index.get(&known_peer.uuid) {
+                    matrix[i][j] = 1;
+                }
+            }
+        }
+
+        AdjacencyMatrix {
+            peer_uuids: self.peers.iter().map(|p| p.uuid.clone()).collect(),
+            global_indices: self.peers.iter().map(|p| p.global_index).collect(),
+            matrix,
+        }
+    }
+
+    /// Save all-peers adjacency matrix to file
+    pub fn save_all_peers_adjacency_matrix(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let adj_matrix = self.create_all_peers_adjacency_matrix();
         let json = serde_json::to_string_pretty(&adj_matrix)?;
         std::fs::write(path, json)?;
         Ok(())

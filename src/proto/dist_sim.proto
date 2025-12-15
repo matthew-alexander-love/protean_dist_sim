@@ -78,7 +78,7 @@ message BootstrapPeerRequest {
 
 /// Request to create multiple peers
 message CreatePeersRequest {
-    repeated protean proto.PeerProto peers = 1;
+    repeated protean_proto.PeerProto peers = 1;
 }
 
 /// Request to delete specific peers

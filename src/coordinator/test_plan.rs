@@ -31,6 +31,7 @@ pub struct SimConfig {
     pub max_peers_per_worker: usize,
     pub num_workers: usize,
     pub data_dir: String,
+    pub output_dir: String,
     pub protean_config: ProteanConfigYaml,
 }
 
@@ -137,11 +138,13 @@ pub enum TestPhase {
         global_indices: IndexRange,
         bootstrap_indices: Vec<u64>,
         rate_per_sec: f64,
+        bootstrap_timeout_sec: u64,
     },
     /// Gradually remove peers from the network.
     GradualLeave {
         global_indices: IndexRange,
         rate_per_sec: f64,
+        bootstrap_timeout_sec: u64,
     },
     /// Simultaneously join and leave peers.
     GradualJoinLeave {
@@ -150,6 +153,7 @@ pub enum TestPhase {
         bootstrap_indices: Vec<u64>,
         join_rate_per_sec: f64,
         leave_rate_per_sec: f64,
+        bootstrap_timeout_sec: u64,
     },
     /// Gradually drift peer embeddings to new positions.
     EmbeddingDrift {
@@ -168,12 +172,15 @@ pub enum TestPhase {
     },
     /// Query phase - execute distributed queries.
     Query {
-        num_queries: usize,
+        /// Number of random peers to execute each query from
+        num_source_peers: usize,
+        /// Indices into DataSet::test for query vectors
         query_indices: Vec<usize>,
+        /// K values to calculate recall for
         k: Vec<usize>,
         query_config: QueryConfigYaml,
-        #[serde(default)]
-        output_path: Option<String>,
+        /// Output filename (placed in output_dir from SimConfig)
+        output_path: String,
     },
 }
 

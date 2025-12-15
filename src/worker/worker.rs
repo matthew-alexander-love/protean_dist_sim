@@ -9,29 +9,23 @@ use tonic::{transport::Channel, Request, Response, Status};
 
 use dashmap::DashMap;
 use crate::proto::dist_sim::{
-    worker_node_server::WorkerNode, 
+    worker_node_server::WorkerNode,
     worker_node_client::WorkerNodeClient,
     coordinator_node_client::CoordinatorNodeClient,
     Ack,
     ProteanConfigProto,
     BootstrapPeerRequest,
     CreatePeersRequest, DeletePeersRequest, ChurnPeersRequest,
-    DriftPeerProto, DriftPeerRequest,
+    DriftPeerRequest,
     QueryRequest, QueryResponse,
     SnapshotRequest, NetworkSnapshot, SnvSnapshotProto,
     WorkerInfo, RouteMessageRequest,
-    ProteanEventType, 
-    StateChangedEvent,
-    QueryCompletedEvent,
-    BootstrapCompletedEvent,
-    ProteanEventProto,
 };
 use crate::proto::protean::SparseNeighborViewProto;
 use crate::worker::actor::{ControlMessage, ActorProtean};
 
 use protean::{
     ProteanConfig,
-    Peer,
     ProteanMessage,
     ProteanPeer,
     QueryConfig,
@@ -68,7 +62,10 @@ pub struct Worker<S: EmbeddingSpace> {
     bootstrap_peer_idx: Mutex<usize>,
 }
 
-impl<S: EmbeddingSpace> Worker<S> {
+impl<S: EmbeddingSpace> Worker<S>
+where
+    S::EmbeddingData: Embedding<Scalar = f32>,
+{
     pub async fn new(worker_id: String, my_address: Address, coordinator_address: Address) -> Result<Self, Status> {
         let runtime_handle = Handle::current();
 
@@ -112,21 +109,22 @@ impl<S: EmbeddingSpace> Worker<S> {
         self.actor_protocol_channels.insert(uuid.clone(), protocol_tx);
         self.actor_control_channels.insert(uuid.clone(), control_tx.clone());
 
+        let max_exploration_interval = config.snv_config.max_exploration_interval;
         let actor = ActorProtean::new(
-            self.my_address.clone(), 
-            uuid.clone(), 
-            embedding, 
+            self.my_address.clone(),
+            uuid.clone(),
+            embedding,
             config,
-            protocol_rx, 
-            control_rx, 
+            protocol_rx,
+            control_rx,
             self.actor_protocol_channels.clone(),
-            self.coordinator.clone(), 
+            self.coordinator.clone(),
             self.workers.clone(),
-            Duration::from_millis(10), 
-            config.snv_config.max_exploration_interval,
+            Duration::from_millis(10),
+            max_exploration_interval,
         );
 
-        self.runtime_handle.spawn(actor.run())?;
+        self.runtime_handle.spawn(actor.run());
         control_tx
     }
 
@@ -152,20 +150,20 @@ impl<S: EmbeddingSpace> Worker<S> {
         ).map_err(|e| Status::internal(format!("Failed to create actor from snapshot: {:?}", e)))?;
 
         self.runtime_handle.spawn(actor.run());
-        control_tx
+        Ok(control_tx)
     }
 
 
     async fn get_bootstrap_server(&self) -> Result<ProteanPeer<S>, Status> {
         let bootstrap_servers = self.bootstrap_servers.read().await;
-        let bootstrap_len: usize = *bootstrap_servers.len();
+        let bootstrap_len: usize = bootstrap_servers.len();
         if bootstrap_len == 0 {
             return Err(Status::failed_precondition("No bootstrap servers configured"));
         }
         let mut idx_guard = self.bootstrap_peer_idx.lock().unwrap();
         let idx = *idx_guard % bootstrap_len;
         *idx_guard = idx_guard.wrapping_add(1);
-        let bootstrap_peer = bootstrap_servers[idx];
+        let bootstrap_peer = bootstrap_servers[idx].clone();
         Ok(bootstrap_peer)
     }
 
@@ -189,7 +187,7 @@ impl<S: EmbeddingSpace> Worker<S> {
         }
 
         for (idx, peer) in peers.into_iter().enumerate() {
-            let peer_control_tx: UnboundedSender<ControlMessage<S>> = self.new_actor(&peer.uuid, peer.embedding, config.clone());
+            let peer_control_tx: UnboundedSender<ControlMessage<S>> = self.new_actor(&peer.peer.uuid, peer.embedding, config.clone());
 
             self.bootstrap_peer(peer_control_tx).await?;
 
@@ -245,7 +243,9 @@ where
         tracing::info!("[Worker {}] set_bootstrap_servers called with {} servers", self.worker_id, num_servers);
         
         let mut bootstrap_servers = self.bootstrap_servers.write().await;
-        *bootstrap_servers = bootstrap_peer_request.bs_server.iter().map(|peer_proto| peer_proto.into()).collect();
+        *bootstrap_servers = bootstrap_peer_request.bs_server.into_iter()
+            .filter_map(|peer_proto| ProteanPeer::try_from(peer_proto).ok())
+            .collect();
         tracing::info!("[Worker {}] Bootstrap servers updated: {} servers configured", self.worker_id, bootstrap_servers.len());
         Ok(Response::new(Ack {}))
     }
@@ -255,7 +255,10 @@ where
         let num_peers = create_peers_request.peers.len();
         tracing::info!("[Worker {}] create_peers called: creating {} peers", self.worker_id, num_peers);
 
-        match self.create_peers(create_peers_request.peers.iter().map(|peer| peer.into()).collect()).await {
+        let peers: Vec<ProteanPeer<S>> = create_peers_request.peers.into_iter()
+            .filter_map(|peer| ProteanPeer::try_from(peer).ok())
+            .collect();
+        match self.create_peers(peers).await {
             Ok(_) => {
                 tracing::info!("[Worker {}] Successfully created {} peers", self.worker_id, num_peers);
                 Ok(Response::new(Ack {}))
@@ -274,11 +277,7 @@ where
         
         let uuids: Vec<Uuid> = delete_peers_request.uuids.iter()
             .map(|uuid_bytes| Uuid::from_slice(uuid_bytes))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                tracing::warn!("[Worker {}] delete_peers failed: Invalid UUID in request: {:?}", self.worker_id, e);
-                Status::invalid_argument("Invalid UUID in request")
-            })?;
+            .collect();
 
         match self.delete_peers(uuids.clone()).await {
             Ok(_) => {
@@ -294,8 +293,10 @@ where
 
     async fn churn_peers(&self, request: Request<ChurnPeersRequest>) -> Result<Response<Ack>, Status> {
         let churn_peers_request = request.into_inner();
-        let num_create = churn_peers_request.create.peers.len();
-        let num_delete = churn_peers_request.delete.uuids.len();
+        let create_request = churn_peers_request.create.unwrap_or_default();
+        let delete_request = churn_peers_request.delete.unwrap_or_default();
+        let num_create = create_request.peers.len();
+        let num_delete = delete_request.uuids.len();
         tracing::info!(
             "[Worker {}] churn_peers called: creating {} peers, deleting {} peers",
             self.worker_id,
@@ -303,7 +304,10 @@ where
             num_delete
         );
 
-        match self.create_peers(churn_peers_request.create.peers.iter().map(|peer| peer.into()).collect()).await {
+        let peers: Vec<ProteanPeer<S>> = create_request.peers.into_iter()
+            .filter_map(|peer| ProteanPeer::try_from(peer).ok())
+            .collect();
+        match self.create_peers(peers).await {
             Ok(_) => {
                 tracing::debug!("[Worker {}] Successfully created {} peers during churn", self.worker_id, num_create);
             }
@@ -313,13 +317,9 @@ where
             }
         }
 
-        let uuids: Vec<Uuid> = churn_peers_request.delete.uuids.iter()
+        let uuids: Vec<Uuid> = delete_request.uuids.iter()
             .map(|uuid_bytes| Uuid::from_slice(uuid_bytes))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                tracing::warn!("[Worker {}] churn_peers failed: Invalid UUID in delete list: {:?}", self.worker_id, e);
-                Status::invalid_argument("Invalid UUID in delete list")
-            })?;
+            .collect();
 
         match self.delete_peers(uuids.clone()).await {
             Ok(_) => {
@@ -344,15 +344,16 @@ where
         tracing::info!("[Worker {}] drift_peer called: {} drift requests", self.worker_id, num_drifts);
 
         for drift in drift_peer_request.drifts.iter() {
-            let uuid = Uuid::from_slice(&drift.uuid).map_err(|e| {
-                tracing::warn!("[Worker {}] drift_peer failed: Invalid UUID: {:?}", self.worker_id, e);
-                Status::invalid_argument("Invalid UUID")
-            })?;
+            let uuid = Uuid::from_slice(&drift.uuid);
             if drift.drift_steps == 0 {
                 tracing::warn!("[Worker {}] drift_peer failed: drift_steps must be > 0 for peer {}", self.worker_id, uuid);
                 return Err(Status::invalid_argument("drift_steps must be > 0"));
             }
-            let target_embedding = S::EmbeddingData::try_from(drift.target_embedding.clone()).map_err(|e| {
+            let embedding_proto = drift.target_embedding.clone().ok_or_else(|| {
+                tracing::warn!("[Worker {}] drift_peer failed: Missing target embedding for peer {}", self.worker_id, uuid);
+                Status::invalid_argument("Missing target embedding")
+            })?;
+            let target_embedding = S::EmbeddingData::try_from(embedding_proto).map_err(|e| {
                 tracing::warn!("[Worker {}] drift_peer failed: Invalid target embedding for peer {}: {:?}", self.worker_id, uuid, e);
                 Status::invalid_argument(format!("Invalid target embedding: {:?}", e))
             })?;
@@ -361,10 +362,10 @@ where
                     tracing::warn!("[Worker {}] drift_peer failed: Peer {} not found", self.worker_id, uuid);
                     Status::not_found(format!("Peer {} not found", uuid))
                 })?;
-            control_tx.send(ControlMessage::StartDrift { 
-                target_embedding: target_embedding, 
-                update_interval: Duration::from_secs(drift.duration_per_step_sec), 
-                total_steps: drift.drift_steps 
+            control_tx.send(ControlMessage::StartDrift {
+                target_embedding,
+                update_interval: Duration::from_secs(drift.duration_per_step_sec),
+                total_steps: drift.drift_steps as u32,
             }).map_err(|e| {
                 tracing::error!("[Worker {}] drift_peer failed: Failed to send drift command to peer {}: {:?}", self.worker_id, uuid, e);
                 Status::internal("Failed to send drift command")
@@ -383,17 +384,18 @@ where
 
     async fn execute_query(&self, request: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let query_request: QueryRequest = request.into_inner();
-        let source_uuid = Uuid::from_slice(&query_request.source_peer_uuid).map_err(|e| {
-            tracing::warn!("[Worker {}] execute_query failed: Invalid source UUID: {:?}", self.worker_id, e);
-            Status::invalid_argument("Invalid source UUID")
-        })?;
+        let source_uuid = Uuid::from_slice(&query_request.source_peer_uuid);
         tracing::info!(
             "[Worker {}] execute_query called: peer={}, k={}",
             self.worker_id,
             source_uuid,
             query_request.k
         );
-        let query_embedding = S::EmbeddingData::try_from(query_request.query_embedding.clone()).map_err(|e| {
+        let embedding_proto = query_request.query_embedding.ok_or_else(|| {
+            tracing::warn!("[Worker {}] execute_query failed: Missing query embedding for peer {}", self.worker_id, source_uuid);
+            Status::invalid_argument("Missing query embedding")
+        })?;
+        let query_embedding = S::EmbeddingData::try_from(embedding_proto).map_err(|e| {
             tracing::warn!("[Worker {}] execute_query failed: Invalid embedding for peer {}: {:?}", self.worker_id, source_uuid, e);
             Status::invalid_argument(format!("Invalid embedding: {:?}", e))
         })?;
@@ -445,10 +447,7 @@ where
         let mut successful = 0;
         let mut failed = 0;
         for uuid_bytes in snapshot_request.peer_uuids.iter() {
-            let uuid = Uuid::from_slice(uuid_bytes).map_err(|e| {
-                tracing::warn!("[Worker {}] get_snapshot failed: Invalid UUID in snapshot request: {:?}", self.worker_id, e);
-                Status::invalid_argument("Invalid UUID in snapshot request")
-            })?;
+            let uuid = Uuid::from_slice(uuid_bytes);
             let (resp_tx, resp_rx) = oneshot::channel();
             if let Some(control_tx) = self.actor_control_channels.get(&uuid) {
                 control_tx.send(ControlMessage::GetSnvSnapshot { response: resp_tx }).map_err(|e| {
@@ -464,12 +463,12 @@ where
                 Ok(actor_snapshot) => {
                     snapshot.peer_uuids.push(uuid.to_bytes());
                     snapshot.snv_snapshots.push(SnvSnapshotProto {
-                        total_peers: actor_snapshot.stats.total_peers,
-                        routable_peers: actor_snapshot.stats.routable_peers,
-                        suspect_peers: actor_snapshot.stats.suspect_peers,
-                        pending_pings: actor_snapshot.stats.pending_pings,
-                        inflight_pings: actor_snapshot.stats.inflight_pings,
-                        dynamism: actor_snapshot.stats.dynamism,
+                        total_peers: actor_snapshot.stats.total_peers as u32,
+                        routable_peers: actor_snapshot.stats.routable_peers as u32,
+                        suspect_peers: actor_snapshot.stats.suspect_peers as u32,
+                        pending_pings: actor_snapshot.stats.pending_pings as u32,
+                        inflight_pings: actor_snapshot.stats.inflight_pings as u32,
+                        dynamism: actor_snapshot.stats.dynamism as u32,
                     });
                     snapshot.peer_snapshots.push(actor_snapshot.proto);
                     successful += 1;
@@ -512,10 +511,7 @@ where
         let mut successful = 0;
         let mut failed = 0;
         for (idx, snv_proto) in network_snapshot.peer_snapshots.into_iter().enumerate() {
-            let uuid = Uuid::from_slice(&network_snapshot.peer_uuids[idx]).map_err(|e| {
-                tracing::warn!("[Worker {}] load_snapshot failed: Invalid UUID at index {}: {:?}", self.worker_id, idx, e);
-                Status::invalid_argument("Invalid UUID in snapshot")
-            })?;
+            let uuid = Uuid::from_slice(&network_snapshot.peer_uuids[idx]);
             match self.new_actor_from_proto(&uuid, snv_proto).await {
                 Ok(peer_control_tx) => {
                     match self.bootstrap_peer(peer_control_tx).await {
@@ -563,10 +559,7 @@ where
 
     async fn route_message(&self, request: Request<RouteMessageRequest>) -> Result<Response<Ack>, Status> {
         let route_message_request: RouteMessageRequest = request.into_inner();
-        let dest_uuid = Uuid::from_slice(&route_message_request.destination_uuid).map_err(|e| {
-            tracing::warn!("[Worker {}] route_message failed: Invalid destination UUID: {:?}", self.worker_id, e);
-            Status::invalid_argument("Invalid destination UUID")
-        })?;
+        let dest_uuid = Uuid::from_slice(&route_message_request.destination_uuid);
 
         let message: ProteanMessage<S> = match route_message_request.message {
             Some(proto) => ProteanMessage::try_from(proto).map_err(|e| {
