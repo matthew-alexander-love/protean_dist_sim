@@ -132,23 +132,6 @@ impl QueryConfigYaml {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TestPhase {
-    NetworkShaping(NetworkShapingPhase),
-    Wait(WaitPhase),
-    Snapshot(SnapshotPhase),
-    Query(QueryPhase),
-}
-
-/// Network shaping phase - controls peer join/leave/drift patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkShapingPhase {
-    #[serde(flatten)]
-    pub pattern: NetworkShapingPattern,
-}
-
-/// Network shaping patterns with their specific parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "pattern")]
-pub enum NetworkShapingPattern {
     /// Gradually join peers to the network.
     GradualJoin {
         global_indices: IndexRange,
@@ -174,6 +157,23 @@ pub enum NetworkShapingPattern {
         end_indices: IndexRange,
         drift_steps: u32,
         duration_per_step_sec: u64,
+    },
+    /// Wait phase - pause execution for a duration.
+    Wait {
+        duration_sec: u64,
+    },
+    /// Snapshot phase - collect network state.
+    Snapshot {
+        output_path: String,
+    },
+    /// Query phase - execute distributed queries.
+    Query {
+        num_queries: usize,
+        query_indices: Vec<usize>,
+        k: Vec<usize>,
+        query_config: QueryConfigYaml,
+        #[serde(default)]
+        output_path: Option<String>,
     },
 }
 
@@ -201,28 +201,6 @@ impl IndexRange {
     }
 }
 
-/// Wait phase - pause execution for a duration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WaitPhase {
-    pub duration_sec: u64,
-}
-
-/// Snapshot phase - collect network state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotPhase {
-    pub output_path: String,
-}
-
-/// Query phase - execute distributed queries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryPhase {
-    pub num_queries: usize,
-    pub query_indices: Vec<usize>,
-    pub k: Vec<usize>,
-    pub query_config: QueryConfigYaml,
-    #[serde(default)]
-    pub output_path: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {
