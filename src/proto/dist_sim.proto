@@ -104,9 +104,9 @@ message DriftPeerRequest {
 
 /* --------------------- Query Messages --------------------- */
 
-/// Request to execute a query from a specific peer
+/// Request to execute a query from specific peers
 message QueryRequest {
-    bytes source_peer_uuid = 1;             // UUID of peer executing the query
+    repeated bytes source_peer_uuids = 1;   // UUIDs of peers executing the query
     onnx.TensorProto query_embedding = 2;   // Query point in embedding space
     uint32 k = 3;                            // Number of neighbors to find
     protean_proto.QueryConfigProto config = 4;  // Query execution config
@@ -114,7 +114,8 @@ message QueryRequest {
 
 /// Response containing query UUID
 message QueryResponse {
-    bytes query_uuid = 1;  // Unique query identifier
+    repeated bytes source_peer_uuid = 1; // Peer ID's
+    repeated bytes query_uuid = 2;  // Corresponding Unique query identifier
 }
 
 /* --------------------- Snapshot Messages --------------------- */
@@ -180,7 +181,9 @@ message QueryCompletedEvent {
     bytes peer_uuid = 1;
     bytes query_uuid = 2;
     repeated protean_proto.QueryCandidateProto candidates = 3;
-    uint32 hops = 4;
+    uint32 num_seen = 4;
+    uint32 num_requests = 5;
+    uint32 num_received = 6;
 }
 
 /// Event: Bootstrap converging phase completed

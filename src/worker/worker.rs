@@ -51,9 +51,6 @@ pub struct Worker<S: EmbeddingSpace> {
     actor_protocol_channels: Arc<DashMap<Uuid, UnboundedSender<ProteanMessage<S>>>>,
     actor_control_channels: Arc<DashMap<Uuid, UnboundedSender<ControlMessage<S>>>>,
 
-    /// Handle to the tokio runtime (uses existing runtime, doesn't create a new one)
-    runtime_handle: Handle,
-
     /// Config for making new peers
     actor_config: Arc<RwLock<ProteanConfig>>,
 
@@ -67,7 +64,6 @@ where
     S::EmbeddingData: Embedding<Scalar = f32>,
 {
     pub async fn new(worker_id: String, my_address: Address, coordinator_address: Address) -> Result<Self, Status> {
-        let runtime_handle = Handle::current();
 
         let coordinator_client=  Self::get_coordinator_client(coordinator_address.clone()).await?;
 
@@ -79,14 +75,13 @@ where
             coordinator_address,
             actor_protocol_channels: Arc::new(DashMap::new()),
             actor_control_channels: Arc::new(DashMap::new()),
-            runtime_handle,
             actor_config: Arc::new(RwLock::new(ProteanConfig::default())),
             bootstrap_servers: Arc::new(RwLock::new(Vec::new())),
             bootstrap_peer_idx: Mutex::new(0),
         })
     }
 
-    /// Get or create coordinator client (lazy connection)
+    /// Get or create coordinator client
     async fn get_coordinator_client(coordinator_address: Address) -> Result<CoordinatorNodeClient<Channel>, Status> {
 
         let url = format!("http://{}", coordinator_address);
@@ -124,7 +119,10 @@ where
             max_exploration_interval,
         );
 
-        self.runtime_handle.spawn(actor.run());
+        tokio::spawn(async move {
+            actor.run();
+        });
+
         control_tx
     }
 
@@ -149,7 +147,10 @@ where
             config.snv_config.max_exploration_interval,
         ).map_err(|e| Status::internal(format!("Failed to create actor from snapshot: {:?}", e)))?;
 
-        self.runtime_handle.spawn(actor.run());
+        tokio::spawn(async move {
+            actor.run();
+        });
+
         Ok(control_tx)
     }
 

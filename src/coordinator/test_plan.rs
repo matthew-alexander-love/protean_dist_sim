@@ -187,19 +187,19 @@ pub enum TestPhase {
 /// A range of global peer indices (inclusive start, exclusive end).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexRange {
-    pub start: u64,
-    pub end: u64,
+    pub start: usize,
+    pub end: usize,
 }
 
 impl IndexRange {
     /// Convert to a Vec of indices.
-    pub fn to_vec(&self) -> Vec<u64> {
+    pub fn to_vec(&self) -> Vec<usize> {
         (self.start..self.end).collect()
     }
 
     /// Get the count of indices in the range.
     pub fn len(&self) -> usize {
-        (self.end - self.start) as usize
+        self.end - self.start
     }
 
     /// Check if the range is empty.

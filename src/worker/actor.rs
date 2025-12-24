@@ -26,8 +26,6 @@ use protean::{
     proto::QueryCandidateProto,
 };
 
-
-
 use tonic::{transport::Channel, Request};
 
 use protean::proto::{ProteanMessageProto, SparseNeighborViewProto};
@@ -276,7 +274,9 @@ where
                         peer_uuid: local_uuid.as_bytes().to_vec(),
                         query_uuid: result.query_uuid.as_bytes().to_vec(),
                         candidates: result.candidates.iter().map(|c| QueryCandidateProto::from(c.clone())).collect(),
-                        hops: 0, // TODO: Track hops in QueryResult
+                        num_seen: result.query_stats.num_seen as u32,
+                        num_requests: result.query_stats.num_requests as u32,
+                        num_received: result.query_stats.num_received as u32,
                     })),
                 }
             },

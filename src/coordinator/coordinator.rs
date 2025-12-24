@@ -28,11 +28,15 @@ use crate::{
         DriftPeerRequest,
         ProteanEventProto,
         QueryRequest,
+        QueryResponse,
         SnapshotRequest,
         WorkerInfo,
         protean_event_proto,
     },
-    proto::protean::PeerProto,
+    proto::protean::{
+        PeerProto,
+        QueryConfigProto,
+    },
     coordinator::test_plan::{
         Config,
         IndexRange,
@@ -89,16 +93,18 @@ pub struct EmbeddingDriftResult {
 /// Result of a single query from one source peer
 #[derive(Debug, Serialize)]
 pub struct SingleQueryResult {
-    pub source_peer: Vec<u8>,
-    pub result_uuids: Vec<Vec<u8>>,
-    pub hops: u32,
+    pub source_peer: Uuid,
+    pub result_index: Vec<usize>,
+    pub num_seen: usize,
+    pub num_requests: usize,
+    pub num_received: usize,
 }
 
 /// Result of a query across multiple source peers
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
     pub query_idx: usize,
-    pub ground_truth: Vec<Vec<u8>>,
+    pub ground_truth: Vec<usize>,
     pub source_results: Vec<SingleQueryResult>,
     pub k_recalls: Vec<(usize, f64)>,  // (k, avg_recall) pairs
     pub duration: Duration,
@@ -130,7 +136,7 @@ pub struct Coordinator<S: EmbeddingSpace> {
 
     workers: Arc<RwLock<Vec<Worker>>>,
 
-    active_peers: Arc<DashSet<Vec<u8>>>,
+    active_peers: Arc<DashSet<usize>>,
 
     /// Notifier signaled when a worker connects
     worker_connected: Arc<Notify>,
@@ -277,8 +283,18 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         tracing::info!("Test plan complete");
     }
 
-    fn create_actor_uuid(embedding_idx: usize) -> Vec<u8> {
-        (embedding_idx as u64).to_be_bytes().to_vec()
+    fn embedding_idx_to_bytes(embedding_idx: &usize) -> Vec<u8> {
+        (embedding_idx as u64).to_be_bytes().to_vect()
+    }
+
+    fn bytes_to_emb_idx(bytes: &[u8]) -> Option<usize> {
+        if uuid.len() == std::mem::size_of::<usize>() {
+            let mut bytes = [0u8; std::mem::size_of::<usize>()];
+            bytes.copy_from_slice(uuid);
+            Some(usize::from_ne_bytes(bytes))
+        } else {
+            None
+        }
     }
 
     async fn get_num_workers(&self) -> usize {
@@ -286,77 +302,711 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         workers_guard.len()
     }
 
-    async fn get_worker_for_embedding(&self, embedding_idx: usize) -> Option<usize> {
-        if embedding_idx >= self.data_set.train.len() {
-            return None;
-        }
-
-        let worker_count = self.get_num_workers().await;
-        if worker_count == 0 {
-            return None;
-        }
-        Some(embedding_idx % worker_count)
+    fn embedding_idx_to_worker_idx(&self, embedding_idx: usize) -> usize {
+        let worker_idx = embedding_idx % self.data_set.train.len();
+        return None;
     }
 
-    fn make_create_peer_requests(
+    async fn worker_idx_to_address(&self, worker_idx: usize) -> Option<Address> {
+        let worker_guard = self.workers.read().await;
+        if let Some(worker) = worker_guard.get(worker_idx) {
+            return Some(worker.address)
+        }
+        return None;
+    }
+
+    async fn worker_idxs_to_addresses(&self, worker_idx: &[usize]) -> Vec<Option<Address>> {
+        let workers_guard = self.workers.read().await;
+        let mut addresses = Vec::new();
+        for idx in worker_idx {
+            addresses.push(self.worker_idx_to_address(idx))
+        }
+        return addresses;
+    }
+
+    /// Assign PeerProtos from embedding indices to their workers, returned as `Vec<Option<Vec<PeerProto>>>` (None if no peers assigned)
+    async fn make_worker_assigned_protos_from_embedding_idxs(
         &self,
-        embedding_idx: &[usize],
-        worker_address: &str,
-    ) -> CreatePeersRequest {
-        let peers = embedding_idx
-            .iter()
-            .filter_map(|&idx| {
-                self.data_set.train.get(idx).map(|embedding| {
-                    PeerProto {
-                        embedding: Some(embedding.clone().into()),
-                        uuid: Self::create_actor_uuid(idx),
-                        address: worker_address.to_string(),
-                    }
-                })
+        embedding_idxs: &[usize],
+    ) -> Vec<Option<Vec<PeerProto>>> {
+        let num_workers = self.get_num_workers().await;
+        let mut worker_assigned_peers: Vec<Option<Vec<PeerProto>>> = vec![None; num_workers];
+
+        for &emb_idx in embedding_idxs {
+            let worker_idx = self.embedding_idx_to_worker_idx(emb_idx);
+            if let Some(worker_address) = self.worker_idx_to_address(worker_idx).await {
+                let peer = PeerProto {
+                    embedding: self.data_set.train.get(emb_idx).cloned(),
+                    uuid: Self::embedding_idx_to_bytes(&emb_idx),
+                    address: worker_address.to_string(),
+                };
+                worker_assigned_peers[worker_idx]
+                    .get_or_insert_with(Vec::new)
+                    .push(peer);
+            }
+        }
+        worker_assigned_peers
+    }
+
+    /// Assign embedding uuids to their workers, returned as `Vec<Option<Vec<Vec<u8>>>>` (None if no uuids assigned)
+    async fn make_worker_assigned_uuids_from_embedding_idxs(
+        &self,
+        embedding_idxs: &[usize],
+    ) -> Vec<Option<Vec<Vec<u8>>>> {
+        let num_workers = self.get_num_workers().await;
+        let mut worker_assigned_uuids: Vec<Option<Vec<Vec<u8>>>> = vec![None; num_workers];
+
+        for &emb_idx in embedding_idxs {
+            let worker_idx = self.embedding_idx_to_worker_idx(emb_idx);
+            let uuid = Self::embedding_idx_to_bytes(&emb_idx);
+            worker_assigned_uuids[worker_idx]
+                .get_or_insert_with(Vec::new)
+                .push(uuid);
+        }
+        worker_assigned_uuids
+    }
+
+    /// Group assigned PeerProtos into per-worker requests, returning Vec<Option<CreatePeersRequest>>
+    async fn make_create_peers_requests(
+        &self,
+        embedding_idxs: &[usize],
+    ) -> Vec<Option<CreatePeersRequest>> {
+        let worker_assigned_peers = self.make_worker_assigned_protos_from_embedding_idxs(embedding_idxs).await;
+        worker_assigned_peers
+            .into_iter()
+            .map(|opt_peers| opt_peers.map(|peers| CreatePeersRequest { peers }))
+            .collect()
+    }
+
+    /// Group assigned uuids into per-worker DeletePeersRequests, returning Vec<Option<DeletePeersRequest>>
+    async fn make_delete_peers_requests(
+        &self,
+        embedding_idxs: &[usize],
+    ) -> Vec<Option<DeletePeersRequest>> {
+        let worker_assigned_uuids = self.make_worker_assigned_uuids_from_embedding_idxs(embedding_idxs).await;
+        worker_assigned_uuids
+            .into_iter()
+            .map(|opt_uuids| opt_uuids.map(|peers| DeletePeersRequest { peers }))
+            .collect()
+    }
+
+
+    /// Group assigned `CreatePeersRequest` and `DeletePeersRequest` into per-worker `ChurnPeersRequest`s, returning Vec<Option<ChurnPeersRequest>>
+    async fn make_churn_requests(
+        &self,
+        create_embedding_idxs: &[usize],
+        delete_embedding_idxs: &[usize],
+    ) -> Vec<Option<ChurnPeersRequest>> {
+        let create_reqs = self.make_create_peers_requests(create_embedding_idxs).await;
+        let delete_reqs = self.make_delete_peers_requests(delete_embedding_idxs).await;
+
+        create_reqs
+            .into_iter()
+            .zip(delete_reqs.into_iter())
+            .map(|(maybe_create, maybe_delete)| {
+                match (maybe_create, maybe_delete) {
+                    (Some(create), Some(delete)) => Some(ChurnPeersRequest { create, delete }),
+                    (Some(create), None) => Some(ChurnPeersRequest { create, delete: DeletePeersRequest { peers: vec![] } }),
+                    (None, Some(delete)) => Some(ChurnPeersRequest { create: CreatePeersRequest { peers: vec![] }, delete }),
+                    (None, None) => None,
+                }
             })
-            .collect();
-
-        CreatePeersRequest { peers }
+            .collect()
     }
 
-    /// Create PeerProtos for bootstrap servers
-    fn make_bootstrap_peer_protos(
+    /// Create PeerProtos for bootstrap servers, flattened into BootstrapPeerRequest (all peers, not grouped per worker)
+    async fn make_bootstrap_peer_request(
         &self,
-        bootstrap_idx: &[u64],
-        worker_address: &str,
-    ) -> Vec<PeerProto> {
-        bootstrap_idx
-            .iter()
-            .filter_map(|&idx| {
-                let idx = idx as usize;
-                self.data_set.train.get(idx).map(|embedding| {
-                    PeerProto {
-                        embedding: Some(embedding.clone().into()),
-                        uuid: Self::create_actor_uuid(idx),
-                        address: worker_address.to_string(),
+        bootstrap_idxs: &[usize],
+    ) -> BootstrapPeerRequest {
+        let worker_assigned_peers = self.make_worker_assigned_protos_from_embedding_idxs(bootstrap_idxs).await;
+
+        let mut degrouped_peers = Vec::new();
+        for maybe_group in worker_assigned_peers {
+            if let Some(mut peer_group) = maybe_group {
+                degrouped_peers.append(&mut peer_group);
+            }
+        }
+
+        BootstrapPeerRequest {
+            bs_server: degrouped_peers,
+        }
+    }
+
+    /// Create drift peer requests for each worker, each request includes the list of (start, end) pairs for their assigned peers.
+    async fn make_drift_peers_requests(
+        &self,
+        start_embedding_idxs: &[usize],
+        end_embedding_idxs: &[usize],
+        drift_steps: usize,
+        duration_per_step_sec: Duration,
+    ) -> Vec<Option<DriftPeerRequest>> {
+        assert_eq!(start_embedding_idxs.len(), end_embedding_idxs.len());
+
+        let num_workers = self.get_num_workers().await;
+        let mut worker_map: Vec<Option<Vec<(PeerProto, PeerProto)>>> = vec![None; num_workers];
+
+        for (&start_idx, &end_idx) in start_embedding_idxs.iter().zip(end_embedding_idxs.iter()) {
+            let worker_idx = self.embedding_idx_to_worker_idx(start_idx);
+            let from_embedding = self.data_set.train.get(start_idx).cloned();
+            let to_embedding = self.data_set.train.get(end_idx).cloned();
+
+            // Optionally, handle None embeddings here...
+            if let (Some(from), Some(to)) = (from_embedding, to_embedding) {
+                let from_peer = PeerProto {
+                    embedding: Some(from),
+                    uuid: Self::embedding_idx_to_bytes(&start_idx),
+                    address: self.worker_idx_to_address(worker_idx).await.map_or_default(|a| a.to_string()),
+                };
+                let to_peer = PeerProto {
+                    embedding: Some(to),
+                    uuid: Self::embedding_idx_to_bytes(&end_idx),
+                    address: self.worker_idx_to_address(worker_idx).await.map_or_default(|a| a.to_string()),
+                };
+                worker_map[worker_idx]
+                    .get_or_insert_with(Vec::new)
+                    .push((from_peer, to_peer));
+            }
+        }
+
+        worker_map
+            .into_iter()
+            .map(|maybe_pairs| {
+                maybe_pairs.map(|peers| {
+                    DriftPeerRequest {
+                        pairs: peers, // pairs is Vec<(PeerProto, PeerProto)>
+                        drift_steps,
+                        duration_per_step_sec: duration_per_step_sec.as_secs() as u32,
                     }
                 })
             })
             .collect()
     }
 
-    /// Gradually join peers to the network at a specified rate
-    ///
-    /// Sends CreatePeersRequests round-robin to workers, one peer per tick.
-    /// Monitors for BootstrapCompleted events and returns when all peers complete
-    /// or the timeout is reached after the last request.
-    async fn gradual_join(
+    async fn make_query_request(
         &self,
-        embedding_idx: IndexRange,
-        bootstrap_idx: Vec<u64>,
-        rate_per_sec: f64,
-        bootstrap_timeout_sec: u64,
+        source_idxs: &[usize],
+        query_idx: usize,
+        k: usize,
+        search_list_size: usize,
+        concurrency_limit: usize,
+        share_floor: usize,
+        timeout: usize,
+    ) -> Vec<Option<QueryRequest>> {
+        let query_embedding = match self.data_set.train.get(query_idx) {
+            Some(embed) => embed.clone(),
+            None => {
+                return vec![None; self.get_num_workers_sync()];
+            }
+        };
+
+        // Make a reusable QueryConfigProto
+        let config = Some(QueryConfigProto {
+            search_list_size: search_list_size as u32,
+            concurrency_limit: concurrency_limit as u32,
+            share_floor: share_floor as u32,
+            timeout: timeout as u64,
+        });
+
+        let num_workers = self.get_num_workers().await;
+        let mut worker_requests: Vec<Option<QueryRequest>> = vec![None; num_workers];
+
+        for &source_idx in source_idxs {
+            let worker_idx = self.embedding_idx_to_worker_idx(source_idx);
+            if let Some(existing_req) = workers[worker_idx] {
+                existing_req.source_peer_uuids.push(Self::embedding_idx_to_bytes(&source_idx));
+            } else {
+                let req = QueryRequest {
+                    source_peer_uuid: vec![Self::embedding_idx_to_bytes(&source_idx)],
+                    query_embedding: Some(query_embedding.clone()),
+                    k: k as u32,
+                    config: config.clone(),
+                };
+                worker_requests[worker_idx] = Some(req);
+            }
+        }
+
+        worker_requests
+    }
+
+    async fn make_snapshot_request(
+        &self,
+        peer_idx: &[usize], // Empty indicates all
+        name: &str,
+    ) -> Vec<Option<SnapshotRequest>> {
+        let num_workers = self.get_num_workers_sync();
+
+        // If no peer indices provided, send empty peer_uuids to all workers (meaning 'all peers')
+        if peer_idx.is_empty() {
+            return (0..num_workers)
+                .map(|_| {
+                    Some(SnapshotRequest {
+                        peer_uuids: vec![], // Empty = all
+                        name: name.to_string(),
+                    })
+                })
+                .collect();
+        }
+
+        // Map worker_idx to the peer_uuids for that worker
+        let mut worker_peer_uuids: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_workers];
+        for &idx in peer_idx {
+            let worker_idx = self.embedding_idx_to_worker_idx(idx);
+            let bytes = Self::embedding_idx_to_bytes(&idx);
+            worker_peer_uuids[worker_idx].push(bytes);
+        }
+
+        worker_peer_uuids
+            .into_iter()
+            .map(|peer_uuids| {
+                if peer_uuids.is_empty() {
+                    None
+                } else {
+                    Some(SnapshotRequest {
+                        peer_uuids,
+                        name: name.to_string(),
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// Result type for bulk peer operations indicating per-worker outcome.
+    #[derive(Debug)]
+    pub struct WorkerOpResult {
+        pub worker_index: usize,
+        pub worker_address: String,
+        pub success: bool,
+        pub error: Option<String>,
+    }
+
+    async fn create_peers(
+        &self,
+        embedding_idxs: &[usize],
+    ) -> Vec<WorkerOpResult> {
+        // Create peer creation requests grouped for each worker
+        let worker_assigned_req = self.make_create_peer_requests(embedding_idxs).await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(worker_assigned_req.len());
+
+        for (idx, maybe_req) in worker_assigned_req.into_iter().enumerate() {
+            if let Some(create_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(create_req.clone());
+                    match worker.client.create_peers(req).await {
+                        Ok(_) => {
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: true,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to create peers on worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("CreatePeers error: {}", e)),
+                            });
+                        }
+                    }
+                } else {
+                    results.push(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    });
+                }
+            } else {
+                results.push(WorkerOpResult {
+                    worker_index: idx,
+                    worker_address: "<no request>".to_string(),
+                    success: true,
+                    error: None,
+                });
+            }
+        }
+
+        results
+    }
+
+    async fn delete_peers(
+        &self,
+        embedding_idxs: &[usize],
+    ) -> Vec<WorkerOpResult> {
+        // Create peer deletion requests grouped for each worker
+        let worker_assigned_req = self.make_delete_peers_requests(embedding_idxs).await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(worker_assigned_req.len());
+
+        for (idx, maybe_req) in worker_assigned_req.into_iter().enumerate() {
+            if let Some(delete_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(delete_req.clone());
+                    match worker.client.delete_peers(req).await {
+                        Ok(_) => {
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: true,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to delete peers on worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("DeletePeers error: {}", e)),
+                            });
+                        }
+                    }
+                } else {
+                    results.push(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    });
+                }
+            } else {
+                results.push(WorkerOpResult {
+                    worker_index: idx,
+                    worker_address: "<no request>".to_string(),
+                    success: true,
+                    error: None,
+                });
+            }
+        }
+
+        results
+    }
+
+    async fn churn_peers(
+        &self,
+        create_embedding_idxs: &[usize],
+        delete_embedding_idxs: &[usize],
+    ) -> Vec<WorkerOpResult> {
+        // Group assigned churn requests per worker
+        let worker_assigned_reqs = self.make_churn_requests(create_embedding_idxs, delete_embedding_idxs).await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(worker_assigned_reqs.len());
+
+        for (idx, maybe_req) in worker_assigned_reqs.into_iter().enumerate() {
+            if let Some(churn_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(churn_req.clone());
+                    match worker.client.churn_peers(req).await {
+                        Ok(_) => {
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: true,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to churn peers on worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("ChurnPeers error: {}", e)),
+                            });
+                        }
+                    }
+                } else {
+                    results.push(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    });
+                }
+            } else {
+                results.push(WorkerOpResult {
+                    worker_index: idx,
+                    worker_address: "<no request>".to_string(),
+                    success: true,
+                    error: None,
+                });
+            }
+        }
+
+        results
+    }
+
+    async fn set_bootstrap_servers(
+        &self,
+        bootstrap_idxs: Vec<usize>,
+    ) -> Vec<WorkerOpResult> {
+        let bootstrap_worker_addresses = self.get_worker_addresses(&bootstrap_idxs);
+
+        let bootstrap_peers = self.make_bootstrap_peer_protos(&bootstrap_idxs, &bootstrap_worker_addresses);
+        let bootstrap_request = BootstrapPeerRequest {
+            bs_server: bootstrap_peers,
+        };
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(workers_guard.len());
+
+        for (idx, worker) in workers_guard.iter_mut().enumerate() {
+            let result = match worker.client.set_bootstrap_servers(Request::new(bootstrap_request.clone())).await {
+                Ok(_) => WorkerOpResult {
+                    worker_index: idx,
+                    worker_address: worker.address.clone(),
+                    success: true,
+                    error: None,
+                },
+                Err(e) => {
+                    tracing::error!("Failed to set bootstrap servers on worker {} (idx {}): {}", worker.address, idx, e);
+                    WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: worker.address.clone(),
+                        success: false,
+                        error: Some(format!("SetBootstrapServers error: {}", e)),
+                    }
+                }
+            };
+            results.push(result);
+        }
+        results
+    }
+
+    async fn drift_peers(
+        &self,
+        start_embedding_idxs: &[usize],
+        end_embedding_idxs: &[usize],
+        drift_steps: usize,
+        duration_per_step_sec: Duration,
+    ) -> Vec<WorkerOpResult> {
+        let worker_requests = self
+            .make_drift_peers_requests(
+                start_embedding_idxs, 
+                end_embedding_idxs, 
+                drift_steps, 
+                duration_per_step_sec
+            )
+            .await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(worker_requests.len());
+
+        for (idx, maybe_req) in worker_requests.into_iter().enumerate() {
+            if let Some(drift_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(drift_req.clone());
+                    match worker.client.drift_peer(req).await {
+                        Ok(_) => {
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: true,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to drift peers on worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            results.push(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("DriftPeers error: {}", e)),
+                            });
+                        }
+                    }
+                } else {
+                    results.push(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    });
+                }
+            } else {
+                results.push(WorkerOpResult {
+                    worker_index: idx,
+                    worker_address: "<no request>".to_string(),
+                    success: true,
+                    error: None,
+                });
+            }
+        }
+
+        results
+    }
+
+    async fn query_peers(
+        &self,
+        source_idxs: &[usize],
+        query_idx: usize,
+        k: usize,
+        search_list_size: usize,
+        concurrency_limit: usize,
+        share_floor: usize,
+        timeout: usize,
+    ) -> Vec<Option<Result<QueryResponse, WorkerOpResult>>> {
+        // Prepare per-worker QueryRequests
+        let worker_requests = self
+            .make_query_request(
+                source_idxs,
+                query_idx,
+                k,
+                search_list_size,
+                concurrency_limit,
+                share_floor,
+                timeout,
+            )
+            .await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut responses = Vec::with_capacity(worker_requests.len());
+
+        for (idx, maybe_req) in worker_requests.into_iter().enumerate() {
+            if let Some(query_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(query_req.clone());
+                    match worker.client.execute_query(req).await {
+                        Ok(response) => {
+                            responses.push(Some(Ok(response.into_inner())));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to execute query on worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            responses.push(Some(Err(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("ExecuteQuery error: {}", e)),
+                            })));
+                        }
+                    }
+                } else {
+                    tracing::warn!("Worker at index {} not found for query.", idx);
+                    responses.push(Some(Err(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    })));
+                }
+            } else {
+                responses.push(None);
+            }
+        }
+
+        responses
+    }
+
+
+    async fn snapshot_peers(
+        &self,
+        peer_idx: &[usize]
+    ) -> Vec<Option<Result<NetworkSnapshot, WorkerOpResult>>> {
+        // Generate per-worker SnapshotRequests
+        let worker_requests = self.make_snapshot_request(peer_idx, "snapshot").await;
+
+        let mut workers_guard = self.workers.write().await;
+        let mut results = Vec::with_capacity(worker_requests.len());
+
+        for (idx, maybe_req) in worker_requests.into_iter().enumerate() {
+            if let Some(snapshot_req) = maybe_req {
+                if let Some(worker) = workers_guard.get_mut(idx) {
+                    let req = Request::new(snapshot_req.clone());
+                    match worker.client.get_snapshot(req).await {
+                        Ok(response) => {
+                            results.push(Some(Ok(response.into_inner())));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to get snapshot from worker {} (idx {}): {}",
+                                worker.address,
+                                idx,
+                                e
+                            );
+                            results.push(Some(Err(WorkerOpResult {
+                                worker_index: idx,
+                                worker_address: worker.address.clone(),
+                                success: false,
+                                error: Some(format!("GetSnapshot error: {}", e)),
+                            })));
+                        }
+                    }
+                } else {
+                    tracing::warn!("Worker at index {} not found for snapshot.", idx);
+                    results.push(Some(Err(WorkerOpResult {
+                        worker_index: idx,
+                        worker_address: "<absent worker>".to_string(),
+                        success: false,
+                        error: Some("Worker not found".to_string()),
+                    })));
+                }
+            } else {
+                // No request for this worker (maybe no peers assigned to this worker)
+                results.push(None);
+            }
+        }
+
+        results
+    }
+
+    fn churn_limited_gradual_join_max_pending(churn_percent_limit: f64, num_pending: usize) -> usize {
+        if num_pending == 0 {
+            retunr 1;
+        }
+
+        let max_pending = churn_percent_limit * (num_pending as f64);
+        if max_pending > 1.0 {
+            return max_pending as usize;
+        } else {
+            return 1;
+        }
+    }
+
+    
+    async fn churn_limited_gradual_join(
+        &self,
+        embedding_idxs: IndexRange,
+        bootstrap_idx: Vec<usize>,
+        churn_percent_limit: f64,
     ) -> GradualJoinResult {
         let start = Instant::now();
-        let indices: Vec<usize> = (embedding_idx.start as usize..embedding_idx.end as usize).collect();
+
+        // Convert IndexRange to concrete indices
+        let indices = embedding_idxs.to_vec();
         let total_peers = indices.len();
 
-        // Handle edge cases
         if total_peers == 0 {
             return GradualJoinResult {
                 total_requested: 0,
@@ -366,9 +1016,7 @@ impl<S: EmbeddingSpace> Coordinator<S> {
             };
         }
 
-        let workers_guard = self.workers.read().await;
-        let num_workers = workers_guard.len();
-
+        let num_workers = self.get_num_workers().await;
         if num_workers == 0 {
             return GradualJoinResult {
                 total_requested: total_peers,
@@ -378,88 +1026,163 @@ impl<S: EmbeddingSpace> Coordinator<S> {
             };
         }
 
-        // Get first worker's address for bootstrap peers
-        let bootstrap_worker_address = workers_guard[0].address.to_string();
-        drop(workers_guard);
-
-        // Build and send bootstrap server config to all workers
-        let bootstrap_peers = self.make_bootstrap_peer_protos(&bootstrap_idx, &bootstrap_worker_address);
-        let bootstrap_request = BootstrapPeerRequest {
-            bs_server: bootstrap_peers,
-        };
-
-        {
-            let mut workers_guard = self.workers.write().await;
-            for worker in workers_guard.iter_mut() {
-                if let Err(e) = worker.client.set_bootstrap_servers(Request::new(bootstrap_request.clone())).await {
-                    tracing::error!("Failed to set bootstrap servers on worker {}: {}", worker.address, e);
-                }
-            }
-        }
-
-        // Calculate tick duration from rate
-        let tick_duration = Duration::from_secs_f64(1.0 / rate_per_sec);
-
-        // Initialize tracking with DashSet for thread-safe access
-        let pending_peers: Arc<DashSet<Vec<u8>>> = Arc::new(DashSet::new());
+        self.set_bootstrap_servers(bootstrap_idxs).await;
+        
+        let pending_peers: Arc<DashSet<usize>> = Arc::new(DashSet::new());
+        let mut pending_limit = Self::churn_limited_gradual_join_max_pending(churn_percent_limit, pending_peers.len());
         let mut completed_count = 0usize;
         let mut send_idx = 0usize;
-        let mut worker_idx = 0usize;
         let mut last_send_time = Instant::now();
         let mut all_sent = false;
 
+        loop {
+            tokio::select! {
+                // Poll to get started
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if !all_sent {
+                        pending_limit = Self::churn_limited_gradual_join_max_pending(churn_percent_limit, pending_peers.len());
+                        let num_to_add = pending_limit - pending_peers.len();
+                        if num_to_add == 0 {
+                            continue;
+                        }
+                        let end_idx = (send_idx + num_to_add).min(indices.len());
+                        let new_indices: Vec<usize> = indices[send_idx..end_idx].to_vec();
+                        let _result = self.create_peers(&new_indices);
+                        for idx in new_indices {
+                            pending_peers.insert(idx);
+                        }
+                        send_idx += num_to_add;
+                        last_send_time = Instant::now();
+                        if send_idx >= total_peers {
+                            all_sent = true;
+                        }
+                    }
+
+                    if all_sent && last_send_time.elapsed() > Duration::from_secs(bootstrap_timeout_sec) {
+                        tracing::warn!(
+                            "Gradual join timed out with {} peers still pending",
+                            pending_peers.len()
+                        );
+                        break;
+                    }
+                }
+
+                Some(event) = async { self.event_rx.lock().await.recv().await } => {
+                    if let Some(protean_event_proto::Event::BootstrapCompleted(bc)) = event.event {
+                        let embedding_idx = Self::bytes_to_emb_idx(&bc.peer_uuid);
+                        if pending_peers.remove(embedding_idx) {
+                            self.active_peers.insert(embedding_idx);
+                            completed_count += 1;
+                        }
+                    }
+
+                    if !all_sent {
+                        pending_limit = Self::churn_limited_gradual_join_max_pending(churn_percent_limit, pending_peers.len());
+                        let num_to_add = pending_limit - pending_peers.len();
+                        if num_to_add == 0 {
+                            continue;
+                        }
+                        let end_idx = (send_idx + num_to_add).min(indices.len());
+                        let new_indices: Vec<usize> = indices[send_idx..end_idx].to_vec();
+                        let _result = self.create_peers(&new_indices);
+                        for idx in new_indices {
+                            pending_peers.insert(idx);
+                        }
+                        send_idx += num_to_add;
+                        last_send_time = Instant::now();
+                        if send_idx >= total_peers {
+                            all_sent = true;
+                        }
+                    }
+
+                    if all_sent && pending_peers.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gradually join peers to the network at a specified rate
+    ///
+    /// Sends CreatePeersRequests round-robin to workers, one peer per tick.
+    /// Monitors for BootstrapCompleted events and returns when all peers complete
+    /// or the timeout is reached after the last request.
+    async fn gradual_join(
+        &self,
+        embedding_idxs: IndexRange,
+        bootstrap_idxs: Vec<usize>,
+        rate_per_sec: f64,
+        bootstrap_timeout_sec: Duration,
+    ) -> GradualJoinResult {
+
+        let start = Instant::now();
+
+        // Convert IndexRange to concrete indices
+        let indices = embedding_idxs.to_vec();
+        let total_peers = indices.len();
+
+        if total_peers == 0 {
+            return GradualJoinResult {
+                total_requested: 0,
+                completed: 0,
+                timed_out: 0,
+                duration: start.elapsed(),
+            };
+        }
+
+        let num_workers = self.get_num_workers().await;
+        if num_workers == 0 {
+            return GradualJoinResult {
+                total_requested: total_peers,
+                completed: 0,
+                timed_out: total_peers,
+                duration: start.elapsed(),
+            };
+        }
+
+        // Set bootstrap servers on all workers as needed
+        self.set_bootstrap_servers(bootstrap_idxs).await;
+
+        // Setup tick interval based on rate
+        let tick_duration = Duration::from_secs_f64(1.0 / rate_per_sec);
         let mut send_interval = interval(tick_duration);
+
+        // Use thread-safe set for pending peers by UUID
+        let pending_peers: Arc<DashSet<usize>> = Arc::new(DashSet::new());
+        let mut completed_count = 0usize;
+        let mut send_idx = 0usize;
+        let mut last_send_time = Instant::now();
+        let mut all_sent = false;
 
         loop {
             tokio::select! {
-                // Send next peer on interval tick
                 _ = send_interval.tick(), if !all_sent => {
                     let idx = indices[send_idx];
-
-                    // Get worker and send request
-                    let mut workers_guard = self.workers.write().await;
-                    let worker = &mut workers_guard[worker_idx];
-                    let worker_address = worker.address.to_string();
-
-                    let request = self.make_create_peer_requests(&[idx], &worker_address);
-
-                    // Track the peer UUID
-                    let peer_uuid = Self::create_actor_uuid(idx);
-                    pending_peers.insert(peer_uuid);
-
-                    // Send to worker
-                    if let Err(e) = worker.client.create_peers(Request::new(request)).await {
-                        tracing::error!("Failed to create peer {} on worker {}: {}", idx, worker.address, e);
-                    }
-
-                    drop(workers_guard);
-
-                    // Advance indices
+                    let result = self.create_peers(&idx);
+                    pending_peers.insert(idx);
                     send_idx += 1;
-                    worker_idx = (worker_idx + 1) % num_workers;
                     last_send_time = Instant::now();
-
                     if send_idx >= total_peers {
                         all_sent = true;
                     }
                 }
 
-                // Process incoming events
                 Some(event) = async { self.event_rx.lock().await.recv().await } => {
                     if let Some(protean_event_proto::Event::BootstrapCompleted(bc)) = event.event {
-                        if pending_peers.remove(&bc.peer_uuid).is_some() {
-                            self.active_peers.insert(bc.peer_uuid);
+                        let embedding_idx = Self::bytes_to_emb_idx(&bc.peer_uuid);
+                        if pending_peers.remove(embedding_idx) {
+                            self.active_peers.insert(embedding_idx);
                             completed_count += 1;
                         }
                     }
 
-                    // Check if done
                     if all_sent && pending_peers.is_empty() {
                         break;
                     }
                 }
 
-                // Timeout check - poll periodically
+                // Timeout check (poll every 1s)
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     if all_sent && last_send_time.elapsed() > Duration::from_secs(bootstrap_timeout_sec) {
                         tracing::warn!(
@@ -492,7 +1215,7 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         bootstrap_timeout_sec: u64,
     ) -> GradualLeaveResult {
         let start = Instant::now();
-        let indices: Vec<usize> = (embedding_idx.start as usize..embedding_idx.end as usize).collect();
+        let indices: Vec<usize> = (embedding_idx.start..embedding_idx.end).collect();
         let total_peers = indices.len();
 
         // Handle edge cases
@@ -521,11 +1244,10 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         // Calculate tick duration from rate
         let tick_duration = Duration::from_secs_f64(1.0 / rate_per_sec);
 
-        // Initialize tracking with DashSet for thread-safe access
-        let pending_peers: Arc<DashSet<Vec<u8>>> = Arc::new(DashSet::new());
+        // Initialize tracking for pending peers
+        let pending_peers: Arc<DashSet<Uuid>> = Arc::new(DashSet::new());
         let mut completed_count = 0usize;
         let mut send_idx = 0usize;
-        let mut worker_idx = 0usize;
         let mut last_send_time = Instant::now();
         let mut all_sent = false;
 
@@ -533,30 +1255,22 @@ impl<S: EmbeddingSpace> Coordinator<S> {
 
         loop {
             tokio::select! {
-                // Send delete request on interval tick (one peer per tick, round-robin workers)
+                // Send delete_peers on interval tick (one peer per tick)
                 _ = send_interval.tick(), if !all_sent => {
                     let idx = indices[send_idx];
                     let peer_uuid = Self::create_actor_uuid(idx);
 
-                    // Get worker and send delete request
-                    let mut workers_guard = self.workers.write().await;
-                    let worker = &mut workers_guard[worker_idx];
-
-                    let request = DeletePeersRequest {
-                        uuids: vec![peer_uuid.clone()],
-                    };
-
                     pending_peers.insert(peer_uuid);
 
-                    if let Err(e) = worker.client.delete_peers(Request::new(request)).await {
-                        tracing::error!("Failed to delete peer {} on worker {}: {}", idx, worker.address, e);
+                    // Call delete_peers: this will handle the client selection
+                    // and round-robin internally if implemented that way.
+                    // This is an async fn on self, so await here.
+                    let result = self.delete_peers(vec![peer_uuid]).await;
+                    if let Err(e) = result {
+                        tracing::error!("Failed to delete peer {}: {}", idx, e);
                     }
 
-                    drop(workers_guard);
-
-                    // Advance indices
                     send_idx += 1;
-                    worker_idx = (worker_idx + 1) % num_workers;
                     last_send_time = Instant::now();
 
                     if send_idx >= total_peers {
@@ -602,11 +1316,16 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         }
     }
 
+
+    ////
+    /// 
+    /// TODO Redo this using above sanity check apis
+    /// 
     /// Gradually join and leave peers simultaneously at specified rates
     ///
-    /// Combines join and leave operations with independent rates.
-    /// Monitors for both BootstrapCompleted (joins) and StateChanged/Shutdown (leaves).
-    /// Returns when all operations complete or timeout is reached.
+    /// Delegates to the churn_peers API, which internally manages the
+    /// desired rates and coordination for simultaneous joins and leaves.
+    /// Returns when all operations complete or a timeout is reached.
     async fn gradual_join_leave(
         &self,
         join_idx: IndexRange,
@@ -616,200 +1335,15 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         leave_rate_per_sec: f64,
         bootstrap_timeout_sec: u64,
     ) -> GradualJoinLeaveResult {
-        let start = Instant::now();
-        let join_indices: Vec<usize> = (join_idx.start as usize..join_idx.end as usize).collect();
-        let leave_indices: Vec<usize> = (leave_idx.start as usize..leave_idx.end as usize).collect();
-        let total_joins = join_indices.len();
-        let total_leaves = leave_indices.len();
-
-        // Handle edge case: nothing to do
-        if total_joins == 0 && total_leaves == 0 {
-            return GradualJoinLeaveResult {
-                join_total: 0,
-                join_completed: 0,
-                join_timed_out: 0,
-                leave_total: 0,
-                leave_completed: 0,
-                leave_timed_out: 0,
-                duration: start.elapsed(),
-            };
-        }
-
-        let workers_guard = self.workers.read().await;
-        let num_workers = workers_guard.len();
-
-        if num_workers == 0 {
-            return GradualJoinLeaveResult {
-                join_total: total_joins,
-                join_completed: 0,
-                join_timed_out: total_joins,
-                leave_total: total_leaves,
-                leave_completed: 0,
-                leave_timed_out: total_leaves,
-                duration: start.elapsed(),
-            };
-        }
-
-        // Get first worker's address for bootstrap peers
-        let bootstrap_worker_address = workers_guard[0].address.to_string();
-        drop(workers_guard);
-
-        // Build and send bootstrap server config to all workers
-        let bootstrap_peers = self.make_bootstrap_peer_protos(&bootstrap_idx, &bootstrap_worker_address);
-        let bootstrap_request = BootstrapPeerRequest {
-            bs_server: bootstrap_peers,
-        };
-
-        {
-            let mut workers_guard = self.workers.write().await;
-            for worker in workers_guard.iter_mut() {
-                if let Err(e) = worker.client.set_bootstrap_servers(Request::new(bootstrap_request.clone())).await {
-                    tracing::error!("Failed to set bootstrap servers on worker {}: {}", worker.address, e);
-                }
-            }
-        }
-
-        // Calculate tick durations from rates
-        let join_tick_duration = Duration::from_secs_f64(1.0 / join_rate_per_sec);
-        let leave_tick_duration = Duration::from_secs_f64(1.0 / leave_rate_per_sec);
-
-        // Initialize tracking with DashSets for thread-safe access
-        let pending_joins: Arc<DashSet<Vec<u8>>> = Arc::new(DashSet::new());
-        let pending_leaves: Arc<DashSet<Vec<u8>>> = Arc::new(DashSet::new());
-        let mut join_completed_count = 0usize;
-        let mut leave_completed_count = 0usize;
-
-        let mut join_send_idx = 0usize;
-        let mut leave_send_idx = 0usize;
-        let mut join_worker_idx = 0usize;
-        let mut leave_worker_idx = 0usize;
-
-        let mut last_activity_time = Instant::now();
-        let mut all_joins_sent = total_joins == 0;
-        let mut all_leaves_sent = total_leaves == 0;
-
-        let mut join_interval = interval(join_tick_duration);
-        let mut leave_interval = interval(leave_tick_duration);
-
-        loop {
-            tokio::select! {
-                // Send next join request on interval tick
-                _ = join_interval.tick(), if !all_joins_sent => {
-                    let idx = join_indices[join_send_idx];
-
-                    // Get worker and send request
-                    let mut workers_guard = self.workers.write().await;
-                    let worker = &mut workers_guard[join_worker_idx];
-                    let worker_address = worker.address.to_string();
-
-                    let request = self.make_create_peer_requests(&[idx], &worker_address);
-
-                    // Track the peer UUID
-                    let peer_uuid = Self::create_actor_uuid(idx);
-                    pending_joins.insert(peer_uuid);
-
-                    // Send to worker
-                    if let Err(e) = worker.client.create_peers(Request::new(request)).await {
-                        tracing::error!("Failed to create peer {} on worker {}: {}", idx, worker.address, e);
-                    }
-
-                    drop(workers_guard);
-
-                    // Advance indices
-                    join_send_idx += 1;
-                    join_worker_idx = (join_worker_idx + 1) % num_workers;
-                    last_activity_time = Instant::now();
-
-                    if join_send_idx >= total_joins {
-                        all_joins_sent = true;
-                    }
-                }
-
-                // Send next leave request on interval tick
-                _ = leave_interval.tick(), if !all_leaves_sent => {
-                    let idx = leave_indices[leave_send_idx];
-                    let peer_uuid = Self::create_actor_uuid(idx);
-
-                    // Get worker and send delete request
-                    let mut workers_guard = self.workers.write().await;
-                    let worker = &mut workers_guard[leave_worker_idx];
-
-                    let request = DeletePeersRequest {
-                        uuids: vec![peer_uuid.clone()],
-                    };
-
-                    pending_leaves.insert(peer_uuid);
-
-                    if let Err(e) = worker.client.delete_peers(Request::new(request)).await {
-                        tracing::error!("Failed to delete peer {} on worker {}: {}", idx, worker.address, e);
-                    }
-
-                    drop(workers_guard);
-
-                    // Advance indices
-                    leave_send_idx += 1;
-                    leave_worker_idx = (leave_worker_idx + 1) % num_workers;
-                    last_activity_time = Instant::now();
-
-                    if leave_send_idx >= total_leaves {
-                        all_leaves_sent = true;
-                    }
-                }
-
-                // Process incoming events
-                Some(event) = async { self.event_rx.lock().await.recv().await } => {
-                    match event.event {
-                        Some(protean_event_proto::Event::BootstrapCompleted(bc)) => {
-                            if pending_joins.remove(&bc.peer_uuid).is_some() {
-                                self.active_peers.insert(bc.peer_uuid);
-                                join_completed_count += 1;
-                                last_activity_time = Instant::now();
-                            }
-                        }
-                        Some(protean_event_proto::Event::StateChanged(sc)) => {
-                            if sc.to_state == "Shutdown" {
-                                if pending_leaves.remove(&sc.peer_uuid).is_some() {
-                                    self.active_peers.remove(&sc.peer_uuid);
-                                    leave_completed_count += 1;
-                                    last_activity_time = Instant::now();
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    // Check if done
-                    if all_joins_sent && all_leaves_sent && pending_joins.is_empty() && pending_leaves.is_empty() {
-                        break;
-                    }
-                }
-
-                // Timeout check - poll periodically
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    if all_joins_sent && all_leaves_sent &&
-                       last_activity_time.elapsed() > Duration::from_secs(bootstrap_timeout_sec) {
-                        tracing::warn!(
-                            "Gradual join/leave timed out with {} joins and {} leaves still pending",
-                            pending_joins.len(),
-                            pending_leaves.len()
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        GradualJoinLeaveResult {
-            join_total: total_joins,
-            join_completed: join_completed_count,
-            join_timed_out: pending_joins.len(),
-            leave_total: total_leaves,
-            leave_completed: leave_completed_count,
-            leave_timed_out: pending_leaves.len(),
-            duration: start.elapsed(),
-        }
+        self.churn_peers(
+            join_idx,
+            leave_idx,
+            bootstrap_idx,
+            join_rate_per_sec,
+            leave_rate_per_sec,
+            bootstrap_timeout_sec,
+        ).await
     }
-
     /// Drift peer embeddings toward target positions over time
     ///
     /// Sends drift commands to all specified peers, then waits for the drift
@@ -824,8 +1358,8 @@ impl<S: EmbeddingSpace> Coordinator<S> {
     ) -> EmbeddingDriftResult {
         let start = Instant::now();
 
-        let start_idx_vec: Vec<usize> = (start_indices.start as usize..start_indices.end as usize).collect();
-        let end_idx_vec: Vec<usize> = (end_indices.start as usize..end_indices.end as usize).collect();
+        let start_idx_vec: Vec<usize> = (start_indices.start..start_indices.end).collect();
+        let end_idx_vec: Vec<usize> = (end_indices.start..end_indices.end).collect();
         let total_peers = start_idx_vec.len();
 
         // Validate 1:1 mapping
@@ -942,19 +1476,8 @@ impl<S: EmbeddingSpace> Coordinator<S> {
         tracing::info!("Wait complete");
     }
 
-    /// Convert UUID bytes back to embedding index
-    fn uuid_to_embedding_idx(uuid: &[u8]) -> Option<usize> {
-        if uuid.len() == std::mem::size_of::<usize>() {
-            let mut bytes = [0u8; std::mem::size_of::<usize>()];
-            bytes.copy_from_slice(uuid);
-            Some(usize::from_ne_bytes(bytes))
-        } else {
-            None
-        }
-    }
-
     /// Compute ground truth by brute-forcing distances to all active peers
-    fn compute_ground_truth(&self, query_embedding: &S::EmbeddingData, k: usize) -> Vec<Vec<u8>> {
+    fn compute_ground_truth(&self, query_embedding: &S::EmbeddingData, k: usize) -> Vec<usize> {
         let mut distances: Vec<(Vec<u8>, S::DistanceValue)> = self
             .active_peers
             .iter()
@@ -975,13 +1498,13 @@ impl<S: EmbeddingSpace> Coordinator<S> {
     }
 
     /// Calculate recall: intersection of results and ground truth divided by k
-    fn calculate_recall(results: &[Vec<u8>], groundtruth: &[Vec<u8>], k: usize) -> f64 {
+    fn calculate_recall(results: &[usize], groundtruth: &[usize], k: usize) -> f64 {
         if k == 0 {
             return 1.0;
         }
 
-        let gt_set: HashSet<&Vec<u8>> = groundtruth.iter().take(k).collect();
-        let result_set: Vec<&Vec<u8>> = results.iter().take(k).collect();
+        let gt_set: HashSet<usize> = groundtruth.iter().take(k).collect();
+        let result_set: Vec<usize> = results.iter().take(k).collect();
 
         let intersection = result_set.iter().filter(|r| gt_set.contains(*r)).count();
         intersection as f64 / k as f64
@@ -1023,7 +1546,7 @@ impl<S: EmbeddingSpace> Coordinator<S> {
 
             // Select N random source peers
             let mut rng = rand::thread_rng();
-            let source_peers: Vec<Vec<u8>> = self
+            let source_peers: Vec<Uuid> = self
                 .active_peers
                 .iter()
                 .map(|r| r.clone())
